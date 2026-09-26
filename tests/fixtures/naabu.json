@@ -1,0 +1,6 @@
+{"host":"10.10.10.5","ip":"10.10.10.5","port":22,"protocol":"tcp"}
+{"ip":"10.10.10.5","port":443,"protocol":"tcp"}
+{"ip":"10.10.10.6","port":{"Port":3306,"Protocol":"TCP"}}
+{"ip":"192.168.99.99","port":445}
+not-json-at-all
+{"ip":"10.10.10.5","port":22,"protocol":"tcp"}

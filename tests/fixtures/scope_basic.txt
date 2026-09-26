@@ -1,0 +1,11 @@
+# engagement ACME-2024-11, authorised 2024-05-01 .. 2024-05-31
+10.10.10.4/30      # small subnet
+10.10.10.20        # jump host
+10.10.10.30-10.10.10.32
+203.0.113.7/32
+
+# rejected below
+example.com        # hostname: not derivable from an IP list
+10.10.10.999
+not-an-address
+10.10.10.50-10.10.10.40

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sn -n -iL targets -oA discovery" start="1716199000" startstr="Mon May 20 10:00:00 2024" version="7.94" xmloutputversion="1.05">
+<host><status state="up" reason="echo-reply" reason_ttl="64"/><address addr="10.10.10.5" addrtype="ipv4"/><hostnames/></host>
+<host><status state="up" reason="echo-reply" reason_ttl="63"/><address addr="10.10.10.6" addrtype="ipv4"/><hostnames/></host>
+<host><status state="down" reason="no-response" reason_ttl="0"/><address addr="10.10.10.7" addrtype="ipv4"/><hostnames/></host>
+<host><status state="up" reason="echo-reply" reason_ttl="64"/><address addr="192.168.99.99" addrtype="ipv4"/><hostnames/></host>
+<runstats><finished time="1716199010" timestr="Mon May 20 10:00:10 2024" elapsed="10.01" exit="success"/><hosts up="3" down="1" total="4"/></runstats>
+</nmaprun>

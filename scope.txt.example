@@ -1,0 +1,21 @@
+# netrecon targets file
+#
+# One entry per line. Accepted forms:
+#   10.20.0.5                  single IPv4/IPv6 address
+#   10.10.10.0/24              CIDR prefix
+#   10.20.0.40-10.20.0.48      inclusive range (same address family)
+#
+# '#' starts a comment. Hostnames are REJECTED: a name cannot be shown to be in
+# scope without DNS, and this file does not authorise scanning whatever it
+# resolves to. List the authorised IPs instead.
+#
+# Record the engagement and its authorised window here so the file is
+# self-documenting when it turns up in a results directory six months later.
+#
+# Engagement : ACME-2024-11
+# Authorised : 2024-05-01 .. 2024-05-31
+# Contact    : soc@acme.example
+
+10.10.10.0/24
+10.20.0.5
+10.20.0.40-10.20.0.48

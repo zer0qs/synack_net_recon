@@ -1,0 +1,94 @@
+# netrecon default configuration.
+#
+# Every value here is validated on load. Rate limits are additionally clamped
+# in code (netrecon/core/config.py): a value above the hard maximum is reduced
+# and logged, it is never honoured.
+
+run_name: default
+output_dir: results
+
+limits:
+  # Packets per second for the fast sweep (masscan / naabu / nmap --max-rate).
+  # Hard maximum enforced in code: 20000. Anything above 1000 prints a warning
+  # in the pre-flight summary.
+  masscan_rate: 1000
+  # Requests per second for the optional nuclei stage. Hard maximum: 300.
+  nuclei_rate: 50
+  # Worker threads for per-host nmap runs. Hard maximum: 64.
+  concurrency: 8
+  # nmap -T template (0 paranoid .. 5 insane). 3 is the polite default.
+  nmap_timing: 3
+  # Per-host nmap budget.
+  host_timeout_seconds: 900
+  # Whole-stage budget for the sweep and discovery tools.
+  stage_timeout_seconds: 7200
+
+stages:
+  discovery: true
+  sweep: true
+  services: true
+  # OS detection needs raw sockets; silently skipped when unprivileged.
+  os_detect: false
+  # Safe NSE scripts. Also reachable with --scripts.
+  scripts: false
+  # nuclei network templates. Requires --active in addition to this flag.
+  nuclei: false
+
+scope:
+  # Refuse to start if the scope file expands beyond this many addresses.
+  max_hosts: 65536
+  # Include network and broadcast addresses of prefixes wider than /31.
+  include_network_broadcast: false
+
+ports:
+  # Curated TCP set used by the fast sweep.
+  sweep: >-
+    21-23,25,53,80,81,88,110,111,135,139,143,161,389,443,445,465,514,515,587,
+    631,636,873,993,995,1025,1080,1099,1433,1521,1723,1883,2049,2181,2375,2376,
+    3000,3128,3306,3389,4443,4786,5000,5060,5432,5601,5672,5900,5985,5986,6000,
+    6379,7001,8000-8010,8080-8090,8443,8888,9000,9042,9090,9100,9200,9300,
+    10000,11211,15672,27017,27018,50000
+  # Used when --full-ports is passed.
+  sweep_full: 1-65535
+  # Deliberately small UDP set (UDP scanning is slow and easy to overdo).
+  udp: 53,67,123,137,161,500,1900,5353
+
+discovery:
+  # auto  : fping when raw sockets are available, otherwise nmap -sn
+  # fping : require fping
+  # nmap  : require nmap -sn
+  # skip  : treat every in-scope address as live (same as --skip-discovery)
+  method: auto
+  fping_retries: 2
+  fping_timeout_ms: 500
+  # Continue against the whole scope if nothing answers discovery. Off by
+  # default: a silent network usually means filtered ICMP, and blindly port
+  # scanning everything is a decision the operator should make explicitly.
+  assume_live_on_empty: false
+
+sweep:
+  # auto | masscan | naabu | nmap
+  backend: auto
+  udp: false
+  retries: 1
+
+services:
+  # nmap --version-intensity (0..9).
+  version_intensity: 5
+  # Adds the safe NSE 'banner' script to the -sV run.
+  banner_grab: false
+
+scripts:
+  # Only 'default', 'discovery', 'safe' and 'version' are accepted. The
+  # categories intrusive, brute, dos, exploit, malware, vuln, fuzzer, external,
+  # broadcast and auth are rejected and can never be enabled.
+  categories:
+    - default
+    - discovery
+
+nuclei:
+  templates:
+    - network/
+  severity: info,low,medium,high,critical
+  concurrency: 10
+  timeout_seconds: 10

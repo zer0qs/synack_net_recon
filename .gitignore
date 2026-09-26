@@ -1,0 +1,16 @@
+# netrecon run output - engagement data, never commit
+results/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

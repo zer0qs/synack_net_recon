@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/bin/../share/nmap/nmap.xsl" type="text/xsl"?>
+<nmaprun scanner="nmap" args="nmap -sV -Pn -n -oA services 10.10.10.5 10.10.10.6 10.10.10.7" start="1716200000" startstr="Mon May 20 10:13:20 2024" version="7.94" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="4" services="22,80,443,3306"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1716200001" endtime="1716200031">
+  <status state="up" reason="user-set" reason_ttl="0"/>
+  <address addr="10.10.10.5" addrtype="ipv4"/>
+  <address addr="00:0c:29:1a:2b:3c" addrtype="mac" vendor="VMware"/>
+  <hostnames>
+    <hostname name="web01.internal" type="user"/>
+  </hostnames>
+  <ports>
+    <port protocol="tcp" portid="22">
+      <state state="open" reason="syn-ack" reason_ttl="64"/>
+      <service name="ssh" product="OpenSSH" version="8.9p1 Ubuntu 3ubuntu0.6" extrainfo="Ubuntu Linux; protocol 2.0" ostype="Linux" method="probed" conf="10">
+        <cpe>cpe:/a:openbsd:openssh:8.9p1</cpe>
+        <cpe>cpe:/o:linux:linux_kernel</cpe>
+      </service>
+      <script id="banner" output="SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"/>
+    </port>
+    <port protocol="tcp" portid="80">
+      <state state="open" reason="syn-ack" reason_ttl="64"/>
+      <service name="http" product="nginx" version="1.18.0" extrainfo="Ubuntu" method="probed" conf="10">
+        <cpe>cpe:/a:igor_sysoev:nginx:1.18.0</cpe>
+      </service>
+      <script id="http-title" output="Welcome to nginx!"/>
+    </port>
+    <port protocol="tcp" portid="443">
+      <state state="closed" reason="reset" reason_ttl="64"/>
+      <service name="https" method="table" conf="3"/>
+    </port>
+  </ports>
+  <os>
+    <osmatch name="Linux 5.0 - 5.14" accuracy="95" line="62122">
+      <osclass type="general purpose" vendor="Linux" osfamily="Linux" osgen="5.X" accuracy="95"/>
+    </osmatch>
+    <osmatch name="Linux 4.15 - 4.19" accuracy="90" line="61234">
+      <osclass type="general purpose" vendor="Linux" osfamily="Linux" osgen="4.X" accuracy="90"/>
+    </osmatch>
+  </os>
+  <hostscript>
+    <script id="smb2-time" output="date: 2024-05-20T10:13:30"/>
+  </hostscript>
+  <times srtt="240" rttvar="120" to="100000"/>
+</host>
+<host starttime="1716200002" endtime="1716200040">
+  <status state="up" reason="user-set" reason_ttl="0"/>
+  <address addr="10.10.10.6" addrtype="ipv4"/>
+  <hostnames/>
+  <ports>
+    <port protocol="tcp" portid="3306">
+      <state state="open" reason="syn-ack" reason_ttl="63"/>
+      <service name="mysql" product="MySQL" version="8.0.36-0ubuntu0.22.04.1" method="probed" conf="10"/>
+    </port>
+    <port protocol="udp" portid="161">
+      <state state="open|filtered" reason="no-response" reason_ttl="0"/>
+      <service name="snmp" method="table" conf="3"/>
+    </port>
+  </ports>
+</host>
+<host starttime="1716200003" endtime="1716200004">
+  <status state="down" reason="no-response" reason_ttl="0"/>
+  <address addr="10.10.10.7" addrtype="ipv4"/>
+  <hostnames/>
+</host>
+<runstats>
+  <finished time="1716200041" timestr="Mon May 20 10:14:01 2024" elapsed="41.12" summary="Nmap done at Mon May 20 10:14:01 2024; 3 IP addresses (2 hosts up) scanned in 41.12 seconds" exit="success"/>
+  <hosts up="2" down="1" total="3"/>
+</runstats>
+</nmaprun>
