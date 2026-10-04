@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netrecon"
-version = "1.0.0"
+version = "1.1.0"
 description = "Scope-enforced, rate-capped network reconnaissance CLI for authorised engagements"
 readme = "README.md"
 requires-python = ">=3.11"

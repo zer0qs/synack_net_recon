@@ -159,12 +159,24 @@ class RunPaths:
         return self.root / "report.md"
 
     @property
+    def report_html(self) -> Path:
+        return self.root / "report.html"
+
+    @property
     def summary(self) -> Path:
         return self.root / "summary.json"
 
     @property
     def nuclei(self) -> Path:
         return self.root / "nuclei.json"
+
+    @property
+    def webrecon(self) -> Path:
+        return self.root / "webrecon.json"
+
+    @property
+    def webrecon_dir(self) -> Path:
+        return self.root / "webrecon"
 
     @property
     def run_log(self) -> Path:
@@ -190,6 +202,11 @@ class RunPaths:
         for directory in (self.root, self.nmap_dir, self.raw_dir, self.targets_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+    def webrecon_host_dir(self, ip: str, port: int) -> Path:
+        """Per-endpoint directory for fetched bodies and scripts."""
+        slug = f"{ip.replace(':', '_').replace('.', '_')}_{port}"
+        return self.webrecon_dir / slug
+
 
 @dataclass
 class RunContext:
@@ -202,6 +219,8 @@ class RunContext:
     tools: ToolRegistry
     privileges: Privileges
     active: bool = False
+    #: Explicit opt-in for the read-only web recon stage (HTTP GET only).
+    web: bool = False
     full_ports: bool = False
     dry_run: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)

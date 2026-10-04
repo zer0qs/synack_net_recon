@@ -28,6 +28,17 @@ NUCLEI_RATE_HARD_MAX = 300
 #: Absolute ceiling on worker threads spawning subprocesses.
 CONCURRENCY_HARD_MAX = 64
 
+#: Absolute ceiling on web recon requests per second.  The web stage only
+#: issues GETs, but a tight loop against one application is still load the
+#: client did not agree to.
+WEBRECON_RATE_HARD_MAX = 50
+
+#: Rate above which the operator gets an explicit warning.
+WEBRECON_RATE_WARN_THRESHOLD = 10
+
+#: Absolute ceiling on bytes read from a single HTTP response (16 MiB).
+WEBRECON_RESPONSE_BYTES_HARD_MAX = 16_777_216
+
 
 class ConfigError(Exception):
     """The configuration is unusable."""
@@ -101,6 +112,7 @@ class Stages:
     os_detect: bool = False
     scripts: bool = False
     nuclei: bool = False
+    webrecon: bool = False
 
     def enabled_names(self) -> list[str]:
         return [f.name for f in fields(self) if getattr(self, f.name)]
@@ -231,6 +243,72 @@ class NucleiCfg:
 
 
 @dataclass
+class WebReconCfg:
+    """Limits for the read-only web recon stage (HTTP GET only)."""
+
+    #: Endpoints probed per run; beyond this the list is truncated and logged.
+    max_endpoints: int = 100
+    #: Scripts analysed per endpoint (inline scripts count toward this).
+    max_scripts_per_endpoint: int = 25
+    #: Hard cap on bytes read from any single response.
+    max_response_bytes: int = 2_097_152  # 2 MiB
+    #: Requests per second across all workers.
+    rate_per_second: float = 5.0
+    request_timeout_seconds: int = 10
+    concurrency: int = 4
+    #: Verify TLS certificates. Off by default: in-scope hosts routinely use
+    #: self-signed certificates, and failing closed would hide the service.
+    verify_tls: bool = False
+    #: Mask candidate secrets in the report. The full value stays in the saved
+    #: response body under webrecon/ for manual verification.
+    redact_secrets: bool = True
+    user_agent: str = "netrecon/1.1 (authorised security assessment)"
+
+    def validate(self) -> list[str]:
+        warnings: list[str] = []
+        if self.max_endpoints < 1:
+            raise ConfigError("webrecon.max_endpoints must be >= 1")
+        if self.max_scripts_per_endpoint < 1:
+            raise ConfigError("webrecon.max_scripts_per_endpoint must be >= 1")
+        if self.max_response_bytes < 1024:
+            raise ConfigError("webrecon.max_response_bytes must be >= 1024")
+        if self.max_response_bytes > WEBRECON_RESPONSE_BYTES_HARD_MAX:
+            warnings.append(
+                f"webrecon.max_response_bytes {self.max_response_bytes} exceeds the hard "
+                f"maximum {WEBRECON_RESPONSE_BYTES_HARD_MAX} and has been clamped"
+            )
+            self.max_response_bytes = WEBRECON_RESPONSE_BYTES_HARD_MAX
+        if self.rate_per_second <= 0:
+            raise ConfigError("webrecon.rate_per_second must be > 0")
+        if self.rate_per_second > WEBRECON_RATE_HARD_MAX:
+            warnings.append(
+                f"webrecon.rate_per_second {self.rate_per_second} exceeds the hard maximum "
+                f"{WEBRECON_RATE_HARD_MAX} rps and has been clamped"
+            )
+            self.rate_per_second = float(WEBRECON_RATE_HARD_MAX)
+        elif self.rate_per_second > WEBRECON_RATE_WARN_THRESHOLD:
+            warnings.append(
+                f"webrecon.rate_per_second {self.rate_per_second} is above the safe "
+                f"default {WEBRECON_RATE_WARN_THRESHOLD} rps - confirm the target web "
+                "services can absorb this"
+            )
+        if self.request_timeout_seconds < 1:
+            raise ConfigError("webrecon.request_timeout_seconds must be >= 1")
+        if self.concurrency < 1:
+            raise ConfigError("webrecon.concurrency must be >= 1")
+        if self.concurrency > CONCURRENCY_HARD_MAX:
+            self.concurrency = CONCURRENCY_HARD_MAX
+        if not self.redact_secrets:
+            warnings.append(
+                "webrecon.redact_secrets is off: candidate credentials will be written "
+                "to report files in full - handle those files as engagement secrets"
+            )
+        if not self.user_agent.strip():
+            raise ConfigError("webrecon.user_agent must not be empty")
+        return warnings
+
+
+@dataclass
 class ScopeCfg:
     max_hosts: int = 65_536
     include_network_broadcast: bool = False
@@ -254,6 +332,7 @@ class Config:
     services: ServicesCfg = field(default_factory=ServicesCfg)
     scripts: ScriptsCfg = field(default_factory=ScriptsCfg)
     nuclei: NucleiCfg = field(default_factory=NucleiCfg)
+    webrecon: WebReconCfg = field(default_factory=WebReconCfg)
 
     #: Warnings raised while validating, surfaced in the pre-flight summary.
     warnings: list[str] = field(default_factory=list)
@@ -289,6 +368,7 @@ class Config:
             "services": ServicesCfg,
             "scripts": ScriptsCfg,
             "nuclei": NucleiCfg,
+            "webrecon": WebReconCfg,
         }
         kwargs: dict[str, Any] = {}
         known_top = {f.name for f in fields(cls)}
@@ -319,6 +399,7 @@ class Config:
             self.sweep,
             self.services,
             self.scripts,
+            self.webrecon,
         ):
             validator = getattr(section, "validate", None)
             if validator is not None:

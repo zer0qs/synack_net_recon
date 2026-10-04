@@ -191,11 +191,13 @@ def report_command(
         tools=ToolRegistry.detect(),
         privileges=privileges_mod.detect(),
         active=False,
+        web=(run_dir / "webrecon.json").is_file(),
         full_ports=False,
         dry_run=False,
     )
     payload = report_build.build(ctx)
     typer.echo(f"report : {ctx.paths.report}")
+    typer.echo(f"html   : {ctx.paths.report_html}")
     typer.echo(f"summary: {ctx.paths.summary}")
     typer.echo(
         f"{payload['totals']['hosts_reported']} host(s), "
@@ -224,6 +226,14 @@ def scan_command(
     banners: bool = typer.Option(False, "--banners", help="Grab banners via the safe NSE banner script."),
     active: bool = typer.Option(
         False, "--active", help="Enable the nuclei stage (template-driven probes, rate-capped)."
+    ),
+    web: bool = typer.Option(
+        False,
+        "--web",
+        help=(
+            "Enable read-only web recon on in-scope HTTP(S) ports: GET only, "
+            "plus JavaScript analysis. No form submission or path brute forcing."
+        ),
     ),
     skip_discovery: bool = typer.Option(
         False, "--skip-discovery", help="Treat every in-scope address as live."
@@ -256,6 +266,7 @@ def scan_command(
             os_detect=os_detect,
             banners=banners,
             active=active,
+            web=web,
             skip_discovery=skip_discovery,
             stages=stages,
         )
@@ -296,6 +307,7 @@ def scan_command(
             tools=ToolRegistry.detect(),
             privileges=privileges_mod.detect(),
             active=active,
+            web=web,
             full_ports=full_ports,
             dry_run=dry_run,
         )
@@ -330,6 +342,7 @@ def scan_command(
             "privileges": ctx.privileges.to_dict(),
             "tools": ctx.tools.to_dict(),
             "active": active,
+            "web": web,
             "dry_run": dry_run,
         },
     )
@@ -346,7 +359,8 @@ def scan_command(
             f"{totals['notable_observations']} notable observation(s)",
             err=True,
         )
-        typer.echo(f"report        : {ctx.paths.report}", err=True)
+        typer.echo(f"report (md)   : {ctx.paths.report}", err=True)
+        typer.echo(f"report (html) : {ctx.paths.report_html}", err=True)
         typer.echo(f"machine JSON  : {ctx.paths.summary}", err=True)
     if outcome.skipped_stages:
         typer.echo(f"skipped stages: {', '.join(outcome.skipped_stages)}", err=True)
@@ -394,6 +408,7 @@ def _apply_overrides(
     os_detect: bool,
     banners: bool,
     active: bool,
+    web: bool,
     skip_discovery: bool,
     stages: str | None,
 ) -> None:
@@ -414,14 +429,24 @@ def _apply_overrides(
     if banners:
         config.services.banner_grab = True
     # The nuclei stage needs the explicit --active opt-in; without it the stage
-    # is off regardless of what the config says.
+    # is off regardless of what the config says. The web stage needs --web the
+    # same way: both send application-layer traffic, so neither turns itself on.
     config.stages.nuclei = bool(active)
+    config.stages.webrecon = bool(web)
     if skip_discovery:
         config.discovery.method = "skip"
 
     if stages:
         requested = {name.strip().lower() for name in stages.split(",") if name.strip()}
-        known = {"discovery", "sweep", "services", "scripts", "nuclei", "os_detect"}
+        known = {
+            "discovery",
+            "sweep",
+            "services",
+            "scripts",
+            "nuclei",
+            "webrecon",
+            "os_detect",
+        }
         unknown = requested - known
         if unknown:
             raise ConfigError(
@@ -431,6 +456,8 @@ def _apply_overrides(
             setattr(config.stages, name, name in requested)
         if "nuclei" in requested and not active:
             raise ConfigError("the nuclei stage also requires --active")
+        if "webrecon" in requested and not web:
+            raise ConfigError("the webrecon stage also requires --web")
 
     # Re-validate so clamping and warnings reflect the overrides.
     config.validate()

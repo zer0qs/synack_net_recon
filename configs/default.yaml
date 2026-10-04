@@ -33,6 +33,8 @@ stages:
   scripts: false
   # nuclei network templates. Requires --active in addition to this flag.
   nuclei: false
+  # Read-only web recon + JavaScript analysis. Requires --web.
+  webrecon: false
 
 scope:
   # Refuse to start if the scope file expands beyond this many addresses.
@@ -92,3 +94,29 @@ nuclei:
   severity: info,low,medium,high,critical
   concurrency: 10
   timeout_seconds: 10
+
+webrecon:
+  # Read-only web reconnaissance. This stage issues HTTP GET requests only:
+  # no form submission, no authentication, no redirect following and no path
+  # brute forcing. The only paths requested are '/', robots.txt, sitemap.xml
+  # and script URLs the page itself links, on the same in-scope endpoint.
+  #
+  # Endpoints probed per run.
+  max_endpoints: 100
+  # Scripts analysed per endpoint (inline scripts count toward this).
+  max_scripts_per_endpoint: 25
+  # Bytes read from any single response. Hard maximum: 16777216 (16 MiB).
+  max_response_bytes: 2097152
+  # Requests per second across all workers. Hard maximum: 50; warns above 10.
+  rate_per_second: 5.0
+  request_timeout_seconds: 10
+  concurrency: 4
+  # Verify TLS certificates. Off by default: in-scope hosts routinely present
+  # self-signed or expired certificates, and failing closed would hide the
+  # service entirely. Certificate problems are reported, not fatal.
+  verify_tls: false
+  # Mask credential-looking strings found in JavaScript. The full value stays
+  # in the saved response body under webrecon/ for manual verification.
+  # Turning this off writes candidate secrets into the report in full.
+  redact_secrets: true
+  user_agent: netrecon/1.1 (authorised security assessment)

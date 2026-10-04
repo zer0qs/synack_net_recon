@@ -12,6 +12,7 @@ from netrecon.core.config import (
     MASSCAN_RATE_HARD_MAX,
     MASSCAN_RATE_WARN_THRESHOLD,
     NUCLEI_RATE_HARD_MAX,
+    WEBRECON_RATE_HARD_MAX,
     Config,
 )
 from netrecon.core.logging_setup import Timer
@@ -21,7 +22,7 @@ from netrecon.core.scope import Scope
 from netrecon.core.state import RunState, timestamp_dirname
 from netrecon.core.tools import ToolRegistry
 from netrecon.report import build as report_build
-from netrecon.stages import discovery, nuclei, scripts, services, sweep
+from netrecon.stages import discovery, nuclei, scripts, services, sweep, webrecon
 from netrecon.stages.base import StageFailed, StageResult, StageSkipped
 
 log = logging.getLogger("netrecon.pipeline")
@@ -33,6 +34,7 @@ STAGE_ORDER: tuple[tuple[str, str, Callable[[RunContext], StageResult]], ...] = 
     ("services", "services", services.run),
     ("scripts", "scripts", scripts.run),
     ("nuclei", "nuclei", nuclei.run),
+    ("webrecon", "webrecon", webrecon.run),
 )
 
 
@@ -74,6 +76,7 @@ def build_context(
     active: bool,
     full_ports: bool,
     dry_run: bool,
+    web: bool = False,
 ) -> RunContext:
     paths = RunPaths(run_dir)
     paths.ensure()
@@ -105,6 +108,7 @@ def build_context(
         tools=tools,
         privileges=privileges,
         active=active,
+        web=web,
         full_ports=full_ports,
         dry_run=dry_run,
     )
@@ -146,6 +150,7 @@ def preflight_summary(ctx: RunContext) -> str:
         f" TCP ports swept   : {_abbrev(ctx.sweep_ports())}",
         f" Stages enabled    : {', '.join(enabled) or 'none'}",
         f" Active stage      : {'ENABLED (nuclei)' if ctx.active else 'disabled'}",
+        f" Web recon         : {'ENABLED (GET only)' if ctx.web else 'disabled'}",
         f" Privileges        : {ctx.privileges.describe()}",
         f" Tools available   : {', '.join(ctx.tools.available()) or 'none'}",
     ]
@@ -190,6 +195,32 @@ def preflight_summary(ctx: RunContext) -> str:
             " ! --active enables nuclei network templates, which send",
             "   template-driven probes rather than passive fingerprinting.",
         ]
+
+    if ctx.web:
+        web = cfg.webrecon
+        lines += [
+            "",
+            " ! --web enables application-layer web reconnaissance against any",
+            "   in-scope HTTP(S) port that was found open. It issues HTTP GET",
+            "   requests only: no form submission, no authentication, no redirect",
+            "   following and no path brute forcing. Paths requested are '/',",
+            "   robots.txt, sitemap.xml and scripts the page itself links.",
+            f"   Rate cap: {web.rate_per_second} rps (hard max {WEBRECON_RATE_HARD_MAX}); "
+            f"up to {web.max_endpoints} endpoint(s),",
+            f"   {web.max_scripts_per_endpoint} script(s) each, "
+            f"{web.max_response_bytes // 1024} KiB per response.",
+        ]
+        if not web.verify_tls:
+            lines.append(
+                "   TLS certificates are not verified (in-scope hosts often use"
+            )
+            lines.append("   self-signed certificates); certificate issues are reported.")
+        if not web.redact_secrets:
+            lines += [
+                " ! webrecon.redact_secrets is OFF: any credential-looking string found",
+                "   in JavaScript will be written to the report in full. Treat the run",
+                "   directory as engagement secrets.",
+            ]
 
     if ctx.dry_run:
         lines += ["", " DRY RUN: no packets will be sent."]

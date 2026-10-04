@@ -61,6 +61,7 @@ def make_context(tmp_path: Path, scope: Scope, fake_tools: ToolRegistry, privile
         tools: ToolRegistry | None = None,
         privileges: Privileges | None = None,
         active: bool = False,
+        web: bool = False,
         dry_run: bool = False,
     ) -> RunContext:
         config = config or Config()
@@ -85,6 +86,7 @@ def make_context(tmp_path: Path, scope: Scope, fake_tools: ToolRegistry, privile
             tools=tools or fake_tools,
             privileges=privileges or privileged,
             active=active,
+            web=web,
             dry_run=dry_run,
         )
 

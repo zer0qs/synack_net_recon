@@ -26,6 +26,8 @@ rather than followed up.
 - [Quick start](#quick-start)
 - [Scope enforcement and CIDR expansion](#scope-enforcement-and-cidr-expansion)
 - [Pipeline](#pipeline)
+- [Web recon and JavaScript analysis](#web-recon-and-javascript-analysis)
+- [Reports](#reports)
 - [Guardrails](#guardrails)
 - [Privileges](#privileges)
 - [Configuration](#configuration)
@@ -92,9 +94,15 @@ sudo netrecon scan --targets scope.txt
 # 4. With safe NSE scripts and banners
 sudo netrecon scan --targets scope.txt --scripts --banners
 
-# 5. Add nuclei network templates (rate-capped, explicit opt-in)
+# 5. Web recon + JavaScript analysis on any in-scope HTTP(S) port
+sudo netrecon scan --targets scope.txt --scripts --web
+
+# 6. Add nuclei network templates (rate-capped, explicit opt-in)
 sudo netrecon scan --targets scope.txt --scripts --active
 ```
+
+Each run writes `report.html` (per host **and** per service category, plus the web
+recon findings) next to `report.md` and `summary.json`.
 
 ## Scope enforcement and CIDR expansion
 
@@ -164,11 +172,91 @@ Stages are modular, individually toggleable, and resumable.
 | 5 | OS detection + banners | `nmap -O`, NSE `banner` | `--os-detect` (needs raw sockets), `--banners` |
 | 6 | Safe NSE scripts | `nmap --script` | `--scripts`; `default`+`discovery`, forced `and safe` |
 | 7 | nuclei network templates | `nuclei` | `--active` only; rate-capped |
-| 8 | Aggregation + reporting | — | `summary.json` + `report.md` |
+| 8 | Web recon + JS analysis | (stdlib HTTP) | `--web` only; GET only, rate-capped |
+| 9 | Aggregation + reporting | — | `summary.json`, `report.md`, `report.html` |
 
 Stages 4–7 read the previous stage's checkpoint and re-filter it through the scope, so no
 stage can broaden the target set of the one before it. Stage 4 in particular scans **only
 the discovered open ports** for each host — never a port range.
+
+## Web recon and JavaScript analysis
+
+`--web` turns on a stage that looks at any in-scope TCP port identified as HTTP(S) — by
+service name from `nmap -sV`, or by port number when `-sV` did not run. It is **read-only**
+and its boundaries are the point of the design:
+
+**What it does**
+
+- One HTTP `GET` of `/` per endpoint, then `GET /robots.txt` and `GET /sitemap.xml`.
+- Records the status line, response headers, page title, `<meta generator>`, HTML comments,
+  form actions (recorded, never submitted), technology hints, version-disclosing headers,
+  and which common security headers are absent.
+- Collects `<script src=…>` references **that point at the same in-scope endpoint**, fetches
+  each with a `GET`, and pattern-matches the body for API paths, source maps, and strings
+  shaped like embedded credentials.
+- Inline `<script>` blocks are analysed with no extra request.
+
+**What it never does**
+
+| Boundary | Why |
+| --- | --- |
+| GET only — no POST/PUT/DELETE, no form submission | This is reconnaissance, not testing |
+| No authentication, no cookie jar, no credential handling | Nothing netrecon finds is ever used to log in |
+| No redirect following | A `Location` is recorded; a redirect cannot walk the scan off the authorised endpoint |
+| No path brute forcing or fuzzing | The only paths requested are `/`, the two well-known files, and scripts the page itself linked |
+| No third-party fetches | A script on a CDN or another host is **not** downloaded — that address is not in scope |
+| Scope re-checked per endpoint | `enforce_strict` runs immediately before the socket opens; the URL host is always the in-scope IP literal, never a name |
+| No proxy | An empty `ProxyHandler` disables `*_PROXY` env vars so scan traffic goes straight to the target |
+
+**Caps** (all in `webrecon:`, all clamped in code): 100 endpoints per run, 25 scripts per
+endpoint, 2 MiB per response (hard max 16 MiB), 5 requests/second (hard max 50, warns above
+10), 10 s per request.
+
+**Secret candidates.** Strings matching AWS/Google/Slack/GitHub/Stripe key shapes, JWTs,
+private-key headers, credentials in URLs, and `api_key = "…"` style assignments are
+reported with the value **masked** (`9f2b********e8 (len 32)`) plus the file and line. The
+full response body is saved under `webrecon/` so you can verify by hand. Obvious
+placeholders (`your_api_key_here`, `${API_KEY}`, the documented AWS example key, low-entropy
+values) are filtered out. These patterns produce false positives by design — treat every hit
+as a lead to check, not a finding. `redact_secrets: false` writes values in full and makes
+the run directory sensitive; it warns loudly in the pre-flight summary.
+
+TLS certificates are not verified by default, because in-scope hosts routinely present
+self-signed or expired certificates and failing closed would hide the service entirely.
+
+## Reports
+
+Every run writes three views of the same data:
+
+| File | Audience |
+| --- | --- |
+| `summary.json` | Machines. The primary format; everything else is derived from it |
+| `report.md` | Terminal, diffs, pasting into notes |
+| `report.html` | A single self-contained page for reading and sharing |
+
+`report.html` has four tabs:
+
+1. **Overview** — run parameters, scope bounds, rate caps, per-stage timings.
+2. **By host** — each host with its ports, versions, NSE output, nuclei findings and notes,
+   with a live filter box.
+3. **By service** — the same ports regrouped into categories: web, databases, remote access,
+   file sharing, directory, mail, management, messaging, infrastructure, other. Service name
+   from `-sV` wins; the port table is only a fallback, so a web server on 3306 is reported as
+   a web service. Rows link back to the host section.
+4. **Web recon** — per endpoint: status, title, technologies, disclosure and missing security
+   headers, well-known files, forms found, and the JavaScript analysis.
+
+The page has **no external resources** — styles and scripts are inline, so opening it on a
+client network does not phone home. Everything interpolated into it is HTML-escaped: page
+titles, banners and headers come from scanned hosts, and a report that executed a scanned
+host's markup when an analyst opened it would be a vulnerability in the tooling. There are
+tests for exactly that.
+
+Regenerate the reports from an existing run directory without rescanning:
+
+```bash
+netrecon report results/acme/20240520T101320Z
+```
 
 ## Guardrails
 
@@ -178,7 +266,8 @@ These are enforced in code, not just in the config file, and are covered by
 - **Rate caps.** `limits.masscan_rate` defaults to **1000 pps**. A hard maximum of
   **20000 pps** is enforced in `netrecon/core/config.py`: a higher value is clamped and
   logged, never honoured. Anything above the 1000 pps default prints a prominent warning in
-  the pre-flight summary. `nuclei_rate` is capped at 300 rps, `concurrency` at 64.
+  the pre-flight summary. `nuclei_rate` is capped at 300 rps, `webrecon.rate_per_second` at
+  50 rps, `concurrency` at 64.
 - **No intrusive NSE.** The categories `intrusive`, `brute`, `dos`, `exploit`, `malware`,
   `vuln`, `fuzzer`, `external`, `broadcast` and `auth` are rejected by config and by flag.
   Only `default`, `discovery`, `safe` and `version` may be selected, and the expression
@@ -199,6 +288,11 @@ These are enforced in code, not just in the config file, and are covered by
   `--yes`.
 - **No shell.** Every subprocess is invoked with an argv list and `shell=False`, so no
   target or port value can be interpreted as shell syntax.
+- **Read-only web stage.** GET only, no redirect following, no form submission, no path
+  brute forcing, no third-party fetches. See
+  [Web recon and JavaScript analysis](#web-recon-and-javascript-analysis).
+- **Report output is escaped.** Scanned hosts control the strings that end up in
+  `report.html`; all of it is HTML-escaped, and the page loads no external resources.
 - **No destructive actions.** netrecon reads; it never authenticates, brute forces, exploits
   or writes to a target. `report.md` says so, because findings are exposure observations, not
   verified vulnerabilities.
@@ -316,6 +410,7 @@ netrecon report        Rebuild report.md / summary.json from a run directory
 | `--os-detect` | Enable OS detection (needs raw sockets) |
 | `--banners` | Grab banners via the safe NSE `banner` script |
 | `--active` | Enable the nuclei stage |
+| `--web` | Enable read-only web recon + JavaScript analysis (GET only) |
 | `--skip-discovery` | Treat every in-scope address as live |
 | `--stages LIST` | Stage allowlist, e.g. `discovery,sweep` |
 | `--resume` / `--resume-dir DIR` | Resume the latest / a specific run |
@@ -336,8 +431,11 @@ results/<run_name>/<UTC-timestamp>/
 ├── scripts.json          # NSE stage output and the expression used
 ├── nuclei.json           # nuclei JSONL (only with --active)
 ├── nuclei_summary.json   # finding counts by severity
+├── webrecon.json         # web recon + JS analysis (only with --web)
+├── webrecon/             # saved response bodies and fetched .js, per endpoint
 ├── summary.json          # PRIMARY machine-readable aggregate
 ├── report.md             # host → ports → service/version → notable findings
+├── report.html           # self-contained: by host, by service category, web recon
 ├── run.log               # structured JSONL: every command, count and timing
 ├── state.json            # checkpoint: per-stage status, counts, durations
 ├── preflight.json        # scope, config, tools and privileges as run
@@ -353,12 +451,21 @@ results/<run_name>/<UTC-timestamp>/
 {
   "generated_at": "...", "run": {...}, "scope": {...}, "limits": {...},
   "stages":  { "sweep": { "status": "completed", "duration_seconds": 12.4, "counts": {...} } },
-  "totals":  { "in_scope_hosts": 254, "live_hosts": 31, "open_ports": 88, ... },
+  "totals":  { "in_scope_hosts": 254, "live_hosts": 31, "open_ports": 88,
+               "service_categories": 5, "web_endpoints": 12,
+               "js_secret_candidates": 3, ... },
+  "categories": [ { "key": "web", "label": "Web services", "host_count": 9,
+                    "port_count": 12, "entries": [ ... ] } ],
   "hosts": [
     { "ip": "10.10.10.5", "hostnames": ["web01"], "os_guess": "Linux 5.0 - 5.14 (95%)",
       "open_ports": [ { "port": 22, "protocol": "tcp", "service": "ssh",
                         "version": "OpenSSH 8.9p1 (Ubuntu Linux)", "scripts": {...} } ],
-      "notes": ["`3306/tcp` MySQL exposed"], "nuclei_findings": [] }
+      "categories": ["web", "database"],
+      "notes": ["`3306/tcp` MySQL exposed"], "nuclei_findings": [],
+      "web_endpoints": [ { "base_url": "http://10.10.10.5:80", "status": 200,
+                           "title": "Acme Portal", "technologies": ["React"],
+                           "missing_security_headers": ["content-security-policy"],
+                           "secret_candidates": 1 } ] }
   ]
 }
 ```
@@ -394,7 +501,7 @@ host's networks. The image bundles nmap, masscan, fping, naabu and nuclei.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q            # ~195 tests, no network access
+pytest -q            # ~317 tests, no network access
 ruff check .
 ```
 
@@ -409,8 +516,13 @@ safety problem:
 | `tests/test_guardrails.py` | Rate clamping, NSE policy, template policy, privilege detection |
 | `tests/test_stage_scope_enforcement.py` | Every stage re-filters its inputs; tampered checkpoints |
 | `tests/test_state_and_report.py` | Checkpoint/resume, pre-flight banner, report aggregation |
+| `tests/test_categories.py` | Service categorisation and the per-category grouping |
+| `tests/test_webrecon.py` | JS analysis, secret masking, and that the web stage stays on the authorised endpoint |
+| `tests/test_report_html.py` | HTML structure, no external resources, escaping of hostile host-supplied strings |
 
-Fixtures in `tests/fixtures/` are recorded tool output; subprocess calls are monkeypatched.
+Fixtures in `tests/fixtures/` are recorded tool output; subprocess calls are monkeypatched,
+and the web stage's HTTP client is replaced with a fake that records every URL it is asked
+for - so the "only these paths may be requested" guarantee is asserted, not assumed.
 
 ## Module layout
 
@@ -432,12 +544,15 @@ netrecon/
 │   ├── sweep.py            # masscan / naabu / nmap
 │   ├── services.py         # nmap -sV, OS detection, banners
 │   ├── scripts.py          # safe NSE policy and execution
-│   └── nuclei.py           # optional active stage
+│   ├── nuclei.py           # optional active stage
+│   └── webrecon.py         # GET-only web recon + JS analysis
 ├── parse/
 │   ├── nmap.py             # nmap XML -> dataclasses
 │   └── masscan.py          # masscan JSON/list, naabu JSON
 └── report/
-    └── build.py            # summary.json + report.md
+    ├── build.py            # summary.json + report.md
+    ├── categories.py       # service -> category mapping and grouping
+    └── html.py             # self-contained report.html
 ```
 
 ## Limitations
@@ -450,5 +565,10 @@ netrecon/
   and easy to overdo against a client network.
 - IPv6 works throughout, but a large IPv6 prefix will hit `scope.max_hosts` — list the hosts
   or ranges you actually have.
-- `report.md` reports exposure observations. Nothing in it is a confirmed vulnerability;
+- The reports hold exposure observations. Nothing in them is a confirmed vulnerability;
   triage is yours.
+- Web recon reads only `/` and what that page links. It does not crawl, so an application
+  whose routes are all behind a login or a client-side router will show little beyond the
+  JavaScript bundle - which is usually where the interesting paths are anyway.
+- JS secret patterns are regex-based and will produce false positives (and miss anything
+  obfuscated or assembled at runtime). Verify every candidate against the saved body.

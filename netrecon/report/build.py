@@ -1,7 +1,11 @@
 """Stage 8: aggregation and reporting.
 
-Produces ``summary.json`` (machine-readable, the primary artifact) and
-``report.md`` (host -> open ports -> service/version -> notable findings).
+Produces, from every earlier stage's checkpoint:
+
+* ``summary.json`` - machine-readable, the primary artifact
+* ``report.md``    - host -> open ports -> service/version -> notable findings
+* ``report.html``  - the same data plus a per-service-category view and the web
+  recon results, as one self-contained page
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from typing import Any
 from netrecon.core.jsonio import read_json, write_json
 from netrecon.core.runner import RunContext
 from netrecon.core.state import utc_now
+from netrecon.report import categories as categories_mod
+from netrecon.report.html import render_html
 
 NAME = "report"
 
@@ -58,6 +64,7 @@ class HostSummary:
     mac: str | None = None
     notes: list[str] = field(default_factory=list)
     nuclei_findings: list[dict[str, Any]] = field(default_factory=list)
+    web_endpoints: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,8 +74,15 @@ class HostSummary:
             "os_guess": self.os_guess,
             "open_port_count": len(self.open_ports),
             "open_ports": self.open_ports,
+            "categories": sorted(
+                {
+                    categories_mod.categorise(p.get("service"), p.get("port"))
+                    for p in self.open_ports
+                }
+            ),
             "notes": self.notes,
             "nuclei_findings": self.nuclei_findings,
+            "web_endpoints": self.web_endpoints,
         }
 
 
@@ -80,6 +94,7 @@ def build(ctx: RunContext) -> dict[str, Any]:
     sweep = read_json(ctx.paths.open_ports, default={}) or {}
     services = read_json(ctx.paths.services, default={}) or {}
     nuclei_findings = _load_nuclei(ctx)
+    webrecon = _load_webrecon(ctx)
 
     summaries: dict[str, HostSummary] = {}
 
@@ -161,6 +176,15 @@ def build(ctx: RunContext) -> dict[str, Any]:
             }
         )
 
+    # Web recon results attach to the host they were collected from. The scope
+    # filter runs again here: a hand-edited webrecon.json cannot add a host.
+    for result in webrecon.get("results") or []:
+        ip = result.get("ip")
+        if not ip or ip not in ctx.scope:
+            continue
+        summary = summaries.setdefault(ip, HostSummary(ip))
+        summary.web_endpoints.append(_web_endpoint_digest(result))
+
     # Hosts that answered discovery but showed no open ports still get a row.
     for ip in live_hosts:
         summaries.setdefault(ip, HostSummary(ip))
@@ -168,17 +192,26 @@ def build(ctx: RunContext) -> dict[str, Any]:
     for summary in summaries.values():
         summary.open_ports.sort(key=lambda p: (p.get("protocol", "tcp"), p.get("port") or 0))
         summary.notes.extend(_notable_notes(summary))
+        summary.notes.extend(_web_notes(summary))
 
     ordered = [summaries[ip] for ip in sorted(summaries, key=_ip_sort_key)]
-    payload = _summary_payload(ctx, ordered, live_hosts, sweep, services, nuclei_findings)
+    categories = categories_mod.group_by_category(ordered)
+    payload = _summary_payload(
+        ctx, ordered, live_hosts, sweep, services, nuclei_findings, webrecon, categories
+    )
 
     write_json(ctx.paths.summary, payload)
-    ctx.paths.report.write_text(render_markdown(payload, ordered), encoding="utf-8")
+    ctx.paths.report.write_text(render_markdown(payload, ordered, categories), encoding="utf-8")
+    ctx.paths.report_html.write_text(
+        render_html(payload, ordered, categories, webrecon), encoding="utf-8"
+    )
 
     log.info(
-        "report written: %d host(s), %d open port(s), %d notable observation(s)",
+        "report written: %d host(s), %d open port(s), %d category/ies, "
+        "%d notable observation(s)",
         payload["totals"]["hosts_reported"],
         payload["totals"]["open_ports"],
+        len(categories),
         payload["totals"]["notable_observations"],
     )
     return payload
@@ -191,9 +224,12 @@ def _summary_payload(
     sweep: dict[str, Any],
     services: dict[str, Any],
     nuclei_findings: list[dict[str, Any]],
+    webrecon: dict[str, Any],
+    categories: list[categories_mod.Category],
 ) -> dict[str, Any]:
     open_ports = sum(len(h.open_ports) for h in hosts)
     notable = sum(len(h.notes) for h in hosts)
+    web_results = webrecon.get("results") or []
     return {
         "generated_at": utc_now(),
         "run": {
@@ -202,6 +238,7 @@ def _summary_payload(
             "started_at": ctx.state.started_at,
             "netrecon_version": ctx.state.netrecon_version,
             "active_stage_enabled": ctx.active,
+            "web_stage_enabled": ctx.web,
             "raw_sockets": ctx.privileges.raw_sockets,
         },
         "scope": ctx.scope.summary(),
@@ -210,6 +247,7 @@ def _summary_payload(
             "nuclei_rate_rps": ctx.config.limits.nuclei_rate,
             "concurrency": ctx.config.limits.concurrency,
             "nmap_timing": ctx.config.limits.nmap_timing,
+            "webrecon_rate_rps": ctx.config.webrecon.rate_per_second if ctx.web else None,
         },
         "stages": {name: stage.to_dict() for name, stage in ctx.state.stages.items()},
         "totals": {
@@ -221,13 +259,23 @@ def _summary_payload(
             "services_identified": services.get("services_identified", 0),
             "nuclei_findings": len(nuclei_findings),
             "notable_observations": notable,
+            "service_categories": len(categories),
+            "web_endpoints": len([r for r in web_results if not r.get("error")]),
+            "js_scripts_analysed": webrecon.get("scripts_analysed", 0),
+            "js_endpoints": webrecon.get("js_endpoints_found", 0),
+            "js_secret_candidates": webrecon.get("secret_candidates", 0),
         },
         "sweep_backend": sweep.get("backend"),
+        "categories": [c.to_dict() for c in categories],
         "hosts": [h.to_dict() for h in hosts],
     }
 
 
-def render_markdown(payload: dict[str, Any], hosts: list[HostSummary]) -> str:
+def render_markdown(
+    payload: dict[str, Any],
+    hosts: list[HostSummary],
+    categories: list[categories_mod.Category] | None = None,
+) -> str:
     totals = payload["totals"]
     scope = payload["scope"]
     limits = payload["limits"]
@@ -263,6 +311,17 @@ def render_markdown(payload: dict[str, Any], hosts: list[HostSummary]) -> str:
         f"| Services identified | {totals['services_identified']} |",
         f"| nuclei findings | {totals['nuclei_findings']} |",
         f"| Notable observations | {totals['notable_observations']} |",
+    ]
+
+    if totals.get("web_endpoints"):
+        lines += [
+            f"| Web endpoints probed | {totals['web_endpoints']} |",
+            f"| JavaScript files analysed | {totals.get('js_scripts_analysed', 0)} |",
+            f"| Paths found in JavaScript | {totals.get('js_endpoints', 0)} |",
+            f"| JS secret candidates | {totals.get('js_secret_candidates', 0)} |",
+        ]
+
+    lines += [
         "",
         "## Stage timings",
         "",
@@ -280,6 +339,31 @@ def render_markdown(payload: dict[str, Any], hosts: list[HostSummary]) -> str:
             f"| {name} | {stage.get('status')} | "
             f"{duration if duration is not None else '-'} | {stage.get('detail') or ''} |"
         )
+
+    if categories:
+        lines += ["", "## Services by category", ""]
+        lines += ["| Category | Hosts | Ports |", "| --- | --- | --- |"]
+        for category in categories:
+            lines.append(
+                f"| {category.label} | {category.host_count} | {len(category.entries)} |"
+            )
+        lines.append("")
+
+        for category in categories:
+            lines += [f"### {category.label}", "", category.description, ""]
+            lines += [
+                "| Host | Port | Proto | Service | Version / banner |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+            for entry in category.entries:
+                host_label = entry.ip
+                if entry.hostnames:
+                    host_label = f"{entry.ip} ({', '.join(entry.hostnames)})"
+                lines.append(
+                    f"| {host_label} | {entry.port} | {entry.protocol} | "
+                    f"{entry.service or '-'} | {_escape(entry.version)} |"
+                )
+            lines.append("")
 
     lines += ["", "## Hosts", ""]
 
@@ -335,6 +419,35 @@ def render_markdown(payload: dict[str, Any], hosts: list[HostSummary]) -> str:
                 )
             lines.append("")
 
+        for endpoint in host.web_endpoints:
+            lines += [f"**Web endpoint `{endpoint['base_url']}`**", ""]
+            if endpoint.get("error"):
+                lines += [f"- Not reachable: {endpoint['error']}", ""]
+                continue
+            lines.append(
+                f"- HTTP {endpoint.get('status')} "
+                f"{_escape(endpoint.get('title')) if endpoint.get('title') else ''}".rstrip()
+            )
+            if endpoint.get("technologies"):
+                lines.append(f"- Technologies: {', '.join(endpoint['technologies'])}")
+            if endpoint.get("missing_security_headers"):
+                lines.append(
+                    f"- Security headers absent: "
+                    f"{', '.join(endpoint['missing_security_headers'])}"
+                )
+            lines.append(
+                f"- JavaScript: {endpoint.get('scripts_analysed', 0)} file(s), "
+                f"{endpoint.get('js_endpoints', 0)} path(s), "
+                f"{endpoint.get('secret_candidates', 0)} secret candidate(s)"
+            )
+            for secret in endpoint.get("secrets") or []:
+                lines.append(
+                    f"  - **{secret.get('kind')}** `{secret.get('name')}` = "
+                    f"`{secret.get('value')}` ({_escape(secret.get('source'))}"
+                    f":{secret.get('line')})"
+                )
+            lines.append("")
+
         if host.notes:
             lines += ["**Notable**", ""]
             lines += [f"- {note}" for note in host.notes]
@@ -347,6 +460,17 @@ def render_markdown(payload: dict[str, Any], hosts: list[HostSummary]) -> str:
         "- Triage the notable observations manually; netrecon performs no",
         "  authentication testing, brute forcing or exploitation.",
         "- Raw tool output is under `nmap/` and `raw/` for verification.",
+    ]
+    if totals.get("web_endpoints"):
+        lines += [
+            "- Verify every JS secret candidate by hand against the saved bodies in",
+            "  `webrecon/`; the values in this report are masked and the patterns that",
+            "  found them produce false positives.",
+            "- Web recon issued GET requests only: no form submission, no redirect",
+            "  following, no path brute forcing.",
+        ]
+    lines += [
+        "- `report.html` has the same data with a per-service-category view.",
         "",
     ]
     return "\n".join(lines)
@@ -368,6 +492,66 @@ def _notable_notes(host: HostSummary) -> list[str]:
         notes.append(
             f"{len(host.open_ports)} open ports - unusually broad exposure for one host"
         )
+    return notes
+
+
+def _load_webrecon(ctx: RunContext) -> dict[str, Any]:
+    """Read the web recon checkpoint, if the stage ran."""
+    payload = read_json(ctx.paths.webrecon, default={}) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _web_endpoint_digest(result: dict[str, Any]) -> dict[str, Any]:
+    """Condense one web recon result into what the reports show per host."""
+    root = result.get("root") or {}
+    totals = result.get("totals") or {}
+    secrets = [
+        secret
+        for script in result.get("scripts") or []
+        for secret in (script.get("secret_candidates") or [])
+    ]
+    return {
+        "base_url": result.get("base_url"),
+        "port": result.get("port"),
+        "scheme": result.get("scheme"),
+        "error": result.get("error"),
+        "status": root.get("status"),
+        "title": root.get("title"),
+        "redirect_to": root.get("redirect_to"),
+        "technologies": root.get("technologies") or [],
+        "disclosure_headers": root.get("disclosure_headers") or {},
+        "missing_security_headers": root.get("missing_security_headers") or [],
+        "scripts_analysed": totals.get("scripts_analysed", 0),
+        "js_endpoints": totals.get("js_endpoints", 0),
+        "secret_candidates": totals.get("secret_candidates", 0),
+        "secrets": secrets,
+    }
+
+
+def _web_notes(host: HostSummary) -> list[str]:
+    """Notable observations derived from the web recon stage."""
+    notes: list[str] = []
+    for endpoint in host.web_endpoints:
+        port = endpoint.get("port")
+        if endpoint.get("error"):
+            continue
+        count = endpoint.get("secret_candidates") or 0
+        if count:
+            notes.append(
+                f"`{port}/tcp` {count} string(s) in JavaScript look like embedded "
+                "credentials - verify manually"
+            )
+        missing = endpoint.get("missing_security_headers") or []
+        if "content-security-policy" in missing:
+            notes.append(f"`{port}/tcp` no Content-Security-Policy response header")
+        if endpoint.get("scheme") == "https" and "strict-transport-security" in missing:
+            notes.append(f"`{port}/tcp` HTTPS without Strict-Transport-Security")
+        disclosed = endpoint.get("disclosure_headers") or {}
+        if disclosed:
+            notes.append(
+                f"`{port}/tcp` version disclosed via "
+                f"{', '.join(sorted(disclosed))}"
+            )
     return notes
 
 
@@ -425,11 +609,16 @@ def _escape(value: Any) -> str:
 
 def stage_counts(payload: dict[str, Any]) -> dict[str, int]:
     totals = payload["totals"]
-    return {
+    counts = {
         "hosts_reported": totals["hosts_reported"],
         "open_ports": totals["open_ports"],
+        "service_categories": totals.get("service_categories", 0),
         "notable_observations": totals["notable_observations"],
     }
+    if totals.get("web_endpoints"):
+        counts["web_endpoints"] = totals["web_endpoints"]
+        counts["js_secret_candidates"] = totals.get("js_secret_candidates", 0)
+    return counts
 
 
 def notable_iter(hosts: Iterable[HostSummary]) -> Iterable[str]:
