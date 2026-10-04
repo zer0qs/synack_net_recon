@@ -222,25 +222,31 @@ def extract_endpoints(body: str, source: str = "") -> list[ApiEndpoint]:
     found: dict[str, ApiEndpoint] = {}
 
     # Method-bearing call sites first, so their method survives deduplication.
+    # Every loop checks the cap *before* inserting, so MAX_ENDPOINTS is a hard
+    # limit: a bundle built to overflow it cannot grow the report past it.
     for pattern in METHOD_CALL_PATTERNS:
         for match in pattern.finditer(body):
             url = match.group("url").strip()
             if not _is_interesting_endpoint(url):
                 continue
+            if url not in found and len(found) >= MAX_ENDPOINTS:
+                break
             kind = "url" if url.startswith(("http://", "https://")) else "path"
             found.setdefault(
                 url, ApiEndpoint(url, kind, match.group("method").upper(), source)
             )
 
     for kind, pattern in ENDPOINT_PATTERNS:
+        if len(found) >= MAX_ENDPOINTS:
+            break
         for match in pattern.finditer(body):
             value = match.group(1).strip()
             if not _is_interesting_endpoint(value):
                 continue
             if value not in found:
+                if len(found) >= MAX_ENDPOINTS:
+                    break
                 found[value] = ApiEndpoint(value, kind, None, source)
-            if len(found) >= MAX_ENDPOINTS:
-                break
 
     return sorted(found.values(), key=lambda e: (e.value.lower(), e.kind))
 
@@ -475,7 +481,12 @@ def _redact_all(text: str | None, values: list[str]) -> str | None:
 
 # -- PII -----------------------------------------------------------------
 
-EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24})\b")
+#: The length bounds are not cosmetic. An unbounded ``[A-Za-z0-9._%+\-]+``
+#: before the ``@`` backtracks over the whole of a long separator-rich run
+#: (``"1-1-1-..."``) at every start position, which is quadratic: 100 KB of
+#: minified code took eleven seconds. 64 is the RFC 5321 local-part limit and
+#: 253 the maximum hostname length, so nothing valid is lost.
+EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24})\b")
 #: Loose international phone shape; validated further below. The window starts
 #: at six so an eight-digit E.164 number is still offered to the validator.
 PHONE_RE = re.compile(r"(?<![\w.])(\+?\d[\d\s().\-]{6,18}\d)(?![\w.])")
@@ -688,8 +699,13 @@ def pii_summary(matches: list[SensitiveMatch]) -> dict[str, int]:
 
 # -- infrastructure leakage ---------------------------------------------
 
+#: The label repetition is bounded for the same reason as :data:`EMAIL_RE`: an
+#: unbounded ``+`` over labels re-walks the whole dotted run at every start
+#: position, so ``"a." * 20000`` took nineteen seconds. A hostname cannot
+#: exceed 253 characters (checked below), and 40 labels is far past anything a
+#: bundle references.
 HOSTNAME_RE = re.compile(
-    r"\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+"
+    r"\b((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){1,40}"
     r"(?:[a-zA-Z]{2,24}|local|internal|corp|lan|intranet))\b"
 )
 

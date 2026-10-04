@@ -51,6 +51,12 @@ MAX_SCAN_CHARS = 20000
 #: Keys read from one object literal, and characters of URL kept.
 MAX_OBJECT_KEYS = 200
 MAX_URL_CHARS = 400
+#: Total characters the brace-aware scanner may walk across one body. Each
+#: unbalanced bracket costs a full MAX_SCAN_CHARS window twice (once to look
+#: for the close, once to split the arguments), and a body can hold thousands
+#: of them: `"x.get(" * 5000` is 30 KB of input and took twenty-two seconds
+#: without this budget. Exhausting it stops the scan, as any other cap does.
+MAX_TOTAL_SCAN_CHARS = 2_000_000
 
 # -- vocabulary ----------------------------------------------------------
 
@@ -295,7 +301,7 @@ def _match_bracket(text: str, index: int, limit: int = MAX_SCAN_CHARS) -> int:
     return -1
 
 
-def _split_top_level(inner: str) -> list[str]:
+def _split_top_level(inner: str, limit: int = MAX_SCAN_CHARS) -> list[str]:
     """Split on commas that sit at the top level of *inner*.
 
     Used for both argument lists and object literals. Commas inside nested
@@ -305,7 +311,7 @@ def _split_top_level(inner: str) -> list[str]:
     buf: list[str] = []
     ctx: list[str] = []
     i = 0
-    end = min(len(inner), MAX_SCAN_CHARS)
+    end = min(len(inner), max(limit, 0))
     while i < end:
         char = inner[i]
         top = ctx[-1] if ctx else None
@@ -541,11 +547,13 @@ _CALL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("xhr", re.compile(r"\.open\s*\(")),
     (
+        # The receiver is matched with a one-character lookbehind rather than a
+        # re-matched dotted chain. The chain form - `name(\.name)*\.verb\(` -
+        # re-walks the whole of a long dotted run at every start position, so
+        # `"a." * 20000` took nine seconds; a fixed-width lookbehind is linear
+        # and also catches `foo().get(` and `rows[0].post(`.
         "generic",
-        re.compile(
-            r"(?<![\w$])[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*"
-            rf"\.(?P<verb>{_VERB_GROUP})\s*\("
-        ),
+        re.compile(rf"(?<=[\w$)\]])\.(?P<verb>{_VERB_GROUP})\s*\("),
     ),
 )
 
@@ -559,32 +567,48 @@ def extract_call_sites(body: str, source: str = "") -> list[CallSite]:
         return []
 
     claimed: dict[int, CallSite] = {}
+    budget = MAX_TOTAL_SCAN_CHARS
     for kind, pattern in _CALL_PATTERNS:
         for match in pattern.finditer(body):
             paren = match.end() - 1
             if paren in claimed:
                 continue  # a more specific pattern already read this call
+            if budget <= 0:
+                break
             verb = match.groupdict().get("verb") if pattern.groupindex else None
-            site = _read_call(body, paren, kind, verb, source, match.start())
+            site, consumed = _read_call(
+                body, paren, kind, verb, source, match.start(), min(MAX_SCAN_CHARS, budget)
+            )
+            budget -= max(consumed, 1)
             if site is not None:
                 claimed[paren] = site
             if len(claimed) >= MAX_CALL_SITES:
                 break
-        if len(claimed) >= MAX_CALL_SITES:
+        if len(claimed) >= MAX_CALL_SITES or budget <= 0:
             break
 
     return [claimed[position] for position in sorted(claimed)]
 
 
 def _read_call(
-    body: str, paren: int, kind: str, verb: str | None, source: str, start: int
-) -> CallSite | None:
-    """Reconstruct one call site, or ``None`` when the URL is not literal."""
-    close = _match_bracket(body, paren)
+    body: str,
+    paren: int,
+    kind: str,
+    verb: str | None,
+    source: str,
+    start: int,
+    limit: int = MAX_SCAN_CHARS,
+) -> tuple[CallSite | None, int]:
+    """Reconstruct one call site, and how many characters it scanned.
+
+    The site is ``None`` when the URL is not literal.
+    """
+    close = _match_bracket(body, paren, limit)
     if close == -1:
         # Truncated or unbalanced source: read a bounded window and try anyway.
-        close = min(len(body), paren + MAX_SCAN_CHARS)
-    arguments = _split_top_level(body[paren + 1 : close])
+        close = min(len(body), paren + limit)
+    consumed = 2 * (close - paren)
+    arguments = _split_top_level(body[paren + 1 : close], limit)
 
     first = arguments[0] if arguments else ""
     second = arguments[1] if len(arguments) > 1 else ""
@@ -597,7 +621,7 @@ def _read_call(
         # XMLHttpRequest: .open("POST", url)
         verb_literal = _literal_prefix(first)
         if verb_literal is None:
-            return None
+            return None, consumed
         method = verb_literal.strip().upper() or None
         raw_url = _literal_prefix(second)
     elif verb:
@@ -607,7 +631,7 @@ def _read_call(
         if raw_url is None:
             inner = _object_inner(first)
             if inner is None:
-                return None
+                return None, consumed
             options = inner
             raw_url = _url_from_options(inner)
         else:
@@ -618,19 +642,19 @@ def _read_call(
         if raw_url is None:
             inner = _object_inner(first)
             if inner is None:
-                return None
+                return None, consumed
             options = inner
             raw_url = _url_from_options(inner)
         else:
             options = _object_inner(second)
 
     if raw_url is None:
-        return None
+        return None, consumed
     # Normalise before the shape test: `${i + 1}` contains a space, and only
     # after it becomes `{param}` does the URL look like the path it is.
     url = _normalise_url(raw_url)
     if not _is_url_like(url):
-        return None
+        return None, consumed
 
     query_params: list[str] = []
     body_params: list[str] = []
@@ -652,7 +676,7 @@ def _read_call(
         body_params = _unique(body_params + extra_body)
 
     path, query = _split_url(url)
-    return CallSite(
+    site = CallSite(
         url=url,
         method=(method or "GET").upper(),
         path=path,
@@ -663,6 +687,7 @@ def _read_call(
         line=body.count("\n", 0, start) + 1,
         kind=kind,
     )
+    return site, consumed
 
 
 def _url_from_options(inner: str) -> str | None:

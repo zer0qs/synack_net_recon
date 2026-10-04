@@ -676,7 +676,7 @@ host's networks. The image bundles nmap, masscan, fping, naabu and nuclei.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q                 # ~1260 tests
+pytest -q                 # ~2535 tests
 pytest -q -m "not e2e"    # the hermetic subset: no sockets at all
 pytest -q -m e2e          # just the end-to-end tests
 ruff check .
@@ -711,6 +711,30 @@ Coverage concentrates on the places where a bug becomes a safety problem:
 | `tests/test_end_to_end.py` | The whole chain against a live fixture server |
 
 Fixtures in `tests/fixtures/` are recorded tool output.
+
+### The stability suite
+
+Four further files answer a different question from the rest of the suite. The tables
+above ask "does this work?"; these ask "what does it do when everything it was handed is
+wrong?" They are heavily parametrised, which is where most of the test count lives.
+
+| File | Covers |
+| --- | --- |
+| `tests/test_stability_parsers.py` | A malformed/truncated/mistyped/encoding corpus against every parser and analyser entry point, with timing budgets |
+| `tests/test_stability_pipeline.py` | Per-stage failure modes: a tool that exits zero with no output, vanishes mid-run, floods stdout, or returns out-of-scope hosts |
+| `tests/test_stability_http.py` | Hostile HTTP responses, redirect loops, oversized bodies, concurrency limits |
+| `tests/test_stability_config_report.py` | Config coercion and rejection, and report rendering over damaged checkpoints |
+
+Three rules hold across all four:
+
+- **Malformed input never fabricates a finding.** Every host, IP, port, endpoint and
+  hostname in a report must trace back to the input, and every port must be in range.
+  A penetration-test report claiming "port 70000 is open" is worse than no report.
+- **A tool that did not run is never reported as a clean result.** An exit-zero run that
+  wrote no output file fails the stage loudly, because the operator cannot otherwise
+  distinguish it from a sweep that genuinely found nothing.
+- **No input hangs the run.** Pathological input is held to an explicit time budget, so
+  a hostile or minified bundle cannot stall the stage behind it.
 
 ## Module layout
 

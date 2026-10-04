@@ -17,7 +17,7 @@ from netrecon.core.config import (
 )
 from netrecon.core.logging_setup import Timer
 from netrecon.core.privileges import DEGRADE_MESSAGE, Privileges
-from netrecon.core.runner import RunContext, RunPaths
+from netrecon.core.runner import RunContext, RunPaths, ToolVanished
 from netrecon.core.scope import Scope
 from netrecon.core.state import RunState, timestamp_dirname
 from netrecon.core.tools import ToolRegistry
@@ -274,6 +274,17 @@ def execute(ctx: RunContext) -> RunOutcome:
             skipped.append(name)
             log.warning("stage %s skipped: %s", name, exc)
             continue
+        except ToolVanished as exc:
+            # The registry found the binary at startup and it is gone now. That
+            # is a stage failure, not a crash: record it like one so the run
+            # stays resumable once the tool is back.
+            ctx.state.fail(name, duration=timer.elapsed, detail=str(exc))
+            failed.append(name)
+            log.error("stage %s: %s", name, exc)
+            if name in {"discovery", "sweep"}:
+                log.error("stopping: later stages depend on %s", name)
+                break
+            continue
         except StageFailed as exc:
             ctx.state.fail(name, duration=timer.elapsed, detail=str(exc))
             failed.append(name)
@@ -287,6 +298,17 @@ def execute(ctx: RunContext) -> RunOutcome:
             log.exception("stage %s raised an unexpected error", name)
             failed.append(name)
             break
+        except BaseException as exc:
+            # Ctrl-C, SystemExit, and anything else that is not an ordinary
+            # error: checkpoint first - otherwise a resume sees the stage as
+            # still "running" with no reason recorded - then let it through.
+            ctx.state.fail(
+                name,
+                duration=timer.elapsed,
+                detail=f"interrupted: {type(exc).__name__}: {exc}".rstrip(": "),
+            )
+            log.error("stage %s interrupted by %s", name, type(exc).__name__)
+            raise
 
         ctx.state.complete(
             name,
@@ -311,9 +333,16 @@ def execute(ctx: RunContext) -> RunOutcome:
             with timer:
                 report_payload = report_build.build(ctx)
         except Exception as exc:  # noqa: BLE001
-            ctx.state.fail("report", duration=timer.elapsed, detail=str(exc))
+            ctx.state.fail("report", duration=timer.elapsed, detail=f"{type(exc).__name__}: {exc}")
             log.exception("report generation failed")
             failed.append("report")
+        except BaseException as exc:
+            ctx.state.fail(
+                "report",
+                duration=timer.elapsed,
+                detail=f"interrupted: {type(exc).__name__}: {exc}".rstrip(": "),
+            )
+            raise
         else:
             ctx.state.complete(
                 "report",

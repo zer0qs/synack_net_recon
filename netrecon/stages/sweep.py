@@ -149,6 +149,13 @@ def _run_masscan(ctx: RunContext, targets: Path, ports: str, rate: int) -> list[
         raise StageFailed("masscan timed out")
     if result.returncode != 0 and not out_path.is_file():
         raise StageFailed(f"masscan failed: {result.tail()}")
+    if not out_path.is_file():
+        # Exit zero with no output file is not "no open ports": it is a tool
+        # that did not run. Reporting it as a clean sweep would be a lie the
+        # operator cannot see.
+        raise StageFailed(
+            f"masscan reported success but wrote no output to {out_path}: {result.tail()}"
+        )
 
     found = masscan_parse.parse_masscan_json(out_path)
 
@@ -193,6 +200,14 @@ def _run_naabu(ctx: RunContext, targets: Path, ports: str, rate: int) -> list[Op
     if result.returncode != 0 and not out_path.is_file():
         raise StageFailed(f"naabu failed: {result.tail()}")
     if not out_path.is_file():
+        # naabu writes no file when it finds nothing, so an exit-zero run with
+        # no output is genuinely ambiguous. Say so rather than inventing a
+        # clean result: a non-empty stderr means the tool had something to
+        # complain about.
+        if result.stderr.strip():
+            raise StageFailed(
+                f"naabu wrote no output and reported: {result.tail()}"
+            )
         return []
     return masscan_parse.parse_naabu_json(out_path)
 

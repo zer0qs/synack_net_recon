@@ -172,9 +172,20 @@ def _float_or_none(value: str | None) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         return None
+    # ``elapsed="nan"`` parses happily and then serialises as bare ``NaN``,
+    # which is not valid JSON and poisons every later comparison.
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+#: nmap never reports a port outside this range; anything else is damaged or
+#: tampered-with output, and reporting "port 70000 is open" would be a
+#: fabricated finding. Port 0 is kept: ``nmap -p0`` is a real scan.
+PORT_RANGE = range(0, 65536)
 
 
 def _parse_service(element: ET.Element) -> Service:
@@ -236,7 +247,7 @@ def _parse_host(element: ET.Element) -> Host | None:
     ports: list[Port] = []
     for port_el in element.findall("ports/port"):
         port_number = _int_or_none(port_el.get("portid"))
-        if port_number is None:
+        if port_number is None or port_number not in PORT_RANGE:
             continue
         state_el = port_el.find("state")
         service_el = port_el.find("service")
@@ -282,20 +293,40 @@ def _parse_host(element: ET.Element) -> Host | None:
     )
 
 
+def _looks_like_xml(text: str) -> bool:
+    """Whether *text* is XML rather than a path.
+
+    A body served to us may carry a UTF-8 BOM or leading whitespace; without
+    stripping both, a perfectly good XML document gets treated as a filename
+    and reported as "not found".
+    """
+    return text.lstrip("﻿\r\n\t ").startswith("<")
+
+
 def parse_nmap_xml(source: str | Path) -> NmapReport:
     """Parse an nmap XML file (or XML string) into a :class:`NmapReport`."""
     try:
-        if isinstance(source, Path) or (
-            isinstance(source, str) and not source.lstrip().startswith("<")
-        ):
+        if isinstance(source, Path) or (isinstance(source, str) and not _looks_like_xml(source)):
             path = Path(source)
-            if not path.is_file():
-                raise NmapParseError(f"nmap XML not found: {path}")
+            # is_file() raises on a name that is too long for the filesystem,
+            # and a megabyte of garbage reaches this branch as a "path".
+            try:
+                exists = path.is_file()
+            except (OSError, ValueError):
+                exists = False
+            if not exists:
+                raise NmapParseError(f"nmap XML not found: {str(path)[:120]}")
             root = ET.parse(path).getroot()  # noqa: S314 - stdlib, no entity resolution
         else:
-            root = ET.fromstring(source)  # noqa: S314
+            root = ET.fromstring(source.lstrip("﻿"))  # noqa: S314
     except ET.ParseError as exc:
         raise NmapParseError(f"malformed nmap XML: {exc}") from exc
+    except ValueError as exc:
+        # A lone surrogate cannot be encoded for the parser (UnicodeEncodeError
+        # is a ValueError); that is malformed input, not a netrecon failure.
+        raise NmapParseError(f"nmap XML could not be decoded: {exc}") from exc
+    except OSError as exc:
+        raise NmapParseError(f"nmap XML could not be read: {exc}") from exc
 
     if root.tag != "nmaprun":
         raise NmapParseError(f"expected <nmaprun> root element, found <{root.tag}>")

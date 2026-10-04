@@ -43,6 +43,12 @@ class OpenPort:
         }
 
 
+#: Scanners never report a port outside this range; anything else is damaged
+#: or tampered-with output, and "port 70000 is open" would be a fabricated
+#: finding rather than a parse of what the host said.
+PORT_RANGE = range(0, 65536)
+
+
 def _dedupe(ports: Iterable[OpenPort]) -> list[OpenPort]:
     seen: set[tuple[str, int, str]] = set()
     unique: list[OpenPort] = []
@@ -68,7 +74,9 @@ def _iter_json_records(text: str) -> Iterable[dict[str, Any]]:
 
     try:
         loaded = json.loads(stripped)
-    except json.JSONDecodeError:
+    # RecursionError, not JSONDecodeError, is what deeply nested brackets raise:
+    # 20 000 of them in one line of tool output used to abort the run.
+    except (json.JSONDecodeError, RecursionError):
         pass
     else:
         records = loaded if isinstance(loaded, list) else [loaded]
@@ -88,7 +96,7 @@ def _iter_json_records(text: str) -> Iterable[dict[str, Any]]:
             continue
         try:
             record, offset = decoder.raw_decode(stripped, index)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             log.warning("skipping malformed JSON record at offset %d", index)
             newline = stripped.find("\n", index)
             if newline == -1:
@@ -109,11 +117,18 @@ def parse_masscan_json(source: str | Path) -> list[OpenPort]:
         ip = record.get("ip")
         if not ip:
             continue  # masscan writes a trailing {"finished": 1} style record
-        for port_entry in record.get("ports") or []:
+        entries = record.get("ports")
+        # "ports" has been seen as a string, a number and null in damaged
+        # output; only a list is iterable in the way this loop needs.
+        if not isinstance(entries, list):
+            continue
+        for port_entry in entries:
             if not isinstance(port_entry, dict):
                 continue
             port = port_entry.get("port")
-            if not isinstance(port, int):
+            if not isinstance(port, int) or isinstance(port, bool):
+                continue
+            if port not in PORT_RANGE:
                 continue
             if str(port_entry.get("status", "open")).lower() != "open":
                 continue
@@ -131,8 +146,11 @@ def parse_masscan_json(source: str | Path) -> list[OpenPort]:
     return _dedupe(results)
 
 
+#: The port group is bounded to five digits: ``int()`` refuses a string of
+#: more than 4300 digits outright (CVE-2020-10735 hardening), so an unbounded
+#: ``\d+`` turns one absurd line of tool output into an uncaught ValueError.
 _LIST_RE = re.compile(
-    r"^(?P<state>open|closed)\s+(?P<proto>\w+)\s+(?P<port>\d+)\s+(?P<ip>[0-9a-fA-F:.]+)"
+    r"^(?P<state>open|closed)\s+(?P<proto>\w{1,16})\s+(?P<port>\d{1,5})\s+(?P<ip>[0-9a-fA-F:.]{1,45})"
 )
 
 
@@ -145,6 +163,8 @@ def parse_masscan_list(source: str | Path) -> list[OpenPort]:
             continue
         match = _LIST_RE.match(line)
         if not match or match.group("state") != "open":
+            continue
+        if int(match.group("port")) not in PORT_RANGE:
             continue
         results.append(
             OpenPort(
@@ -171,7 +191,7 @@ def parse_naabu_json(source: str | Path) -> list[OpenPort]:
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             log.warning("skipping malformed naabu record on line %d", lineno)
             continue
         if not isinstance(record, dict):
@@ -188,7 +208,9 @@ def parse_naabu_json(source: str | Path) -> list[OpenPort]:
             port_field = port_field.get("Port")
         if isinstance(port_field, str) and port_field.isdigit():
             port_field = int(port_field)
-        if not isinstance(port_field, int):
+        if not isinstance(port_field, int) or isinstance(port_field, bool):
+            continue
+        if port_field not in PORT_RANGE:
             continue
 
         results.append(
@@ -212,14 +234,37 @@ def port_spec(ports: Iterable[OpenPort], protocol: str = "tcp") -> str:
     return ",".join(str(n) for n in numbers)
 
 
+def _is_readable_file(path: Path) -> bool:
+    """``path.is_file()`` that never raises.
+
+    ``is_file()`` propagates ``OSError`` for a name the filesystem rejects
+    outright - ``ENAMETOOLONG`` for a component over 255 bytes - and
+    ``ValueError`` for an embedded null byte. Tool output handed in as a string
+    reaches this check, so a single long line of scanner garbage must read as
+    "not a file" rather than abort the run.
+    """
+    try:
+        return path.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def _read(source: str | Path) -> str:
     if isinstance(source, Path):
-        if not source.is_file():
+        if not _is_readable_file(source):
             log.warning("output file missing: %s", source)
             return ""
-        return source.read_text(encoding="utf-8", errors="replace")
+        return _read_file(source)
     text = str(source)
     candidate = Path(text) if len(text) < 4096 and "\n" not in text else None
-    if candidate is not None and candidate.is_file():
-        return candidate.read_text(encoding="utf-8", errors="replace")
+    if candidate is not None and _is_readable_file(candidate):
+        return _read_file(candidate)
     return text
+
+
+def _read_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("output file %s could not be read: %s", path, exc)
+        return ""

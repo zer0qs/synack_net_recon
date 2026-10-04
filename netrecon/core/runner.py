@@ -26,6 +26,14 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
+class ToolVanished(Exception):
+    """A tool that the registry found is no longer runnable.
+
+    Separate from :class:`CommandFailed` because nothing is wrong with the
+    command: the binary itself went away between detection and execution.
+    """
+
+
 class CommandFailed(Exception):
     """A subprocess exited non-zero (and the caller asked us to care)."""
 
@@ -84,6 +92,9 @@ def run_command(
             argv,
             capture_output=True,
             text=True,
+            # Scan tools do emit raw bytes from banners and certificates; a
+            # non-UTF-8 byte must not take the whole stage down.
+            errors="replace",
             timeout=timeout,
             cwd=str(cwd) if cwd else None,
             input=stdin_data,
@@ -96,7 +107,12 @@ def run_command(
         stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
         returncode = 124
     except FileNotFoundError as exc:
-        raise FileNotFoundError(f"{argv[0]} is not installed or not on PATH") from exc
+        # The tool was present when the registry was built and is gone now
+        # (a stale PATH, or removed mid-run). Raise the stage-level type so a
+        # stage does not leak a bare OSError to the pipeline.
+        raise ToolVanished(f"{argv[0]} is not installed or not on PATH") from exc
+    except PermissionError as exc:
+        raise ToolVanished(f"{argv[0]} is not executable: {exc}") from exc
 
     duration = round(time.monotonic() - started, 3)
     result = CommandResult(argv, returncode, stdout or "", stderr or "", duration, timed_out)
@@ -125,15 +141,40 @@ def run_parallel(
     *,
     concurrency: int,
     label: str = "task",
+    on_error: Callable[[T, Exception], R] | None = None,
 ) -> list[R]:
-    """Map *worker* over *items* with a bounded thread pool, in input order."""
+    """Map *worker* over *items* with a bounded thread pool, in input order.
+
+    ``Executor.map`` is fail-fast: the first exception propagates and every
+    result already computed is thrown away. For a scan that is the wrong
+    trade - one unreachable or hostile host would void the work done against
+    every other host in the batch, and the stage would write no checkpoint at
+    all.
+
+    So pass ``on_error``: it is called with the item and the exception, and
+    whatever it returns takes that item's place in the results. The remaining
+    items are unaffected. Without it the old fail-fast behaviour applies, which
+    is only right when a single failure genuinely invalidates the batch.
+    """
     items = list(items)
     if not items:
         return []
     workers = max(1, min(concurrency, len(items)))
     log.debug("running %d %s(s) with %d worker(s)", len(items), label, workers)
+
+    if on_error is None:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=label) as pool:
+            return list(pool.map(worker, items))
+
+    def guarded(item: T) -> R:
+        try:
+            return worker(item)
+        except Exception as exc:  # noqa: BLE001 - isolating one item is the point
+            log.warning("%s failed for %r: %s", label, item, exc)
+            return on_error(item, exc)
+
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=label) as pool:
-        return list(pool.map(worker, items))
+        return list(pool.map(guarded, items))
 
 
 @dataclass
@@ -276,7 +317,11 @@ class RunContext:
         path = self.paths.live_hosts
         if not path.is_file():
             return []
-        raw = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+        # errors="replace": a checkpoint can be hand-edited or written by a
+        # tool that emitted raw bytes; an undecodable line must be dropped by
+        # scope enforcement, not crash the stage that reads it.
+        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = [line.strip() for line in text.splitlines()]
         return list(self.scope.enforce(raw).allowed_str)
 
     def stage_timeout(self) -> int:

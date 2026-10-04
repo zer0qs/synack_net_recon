@@ -573,7 +573,9 @@ class CveFeed:
             raise MissingFeed(f"CVE feed {feed_path} could not be read: {exc}") from exc
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        # Deeply nested brackets raise RecursionError rather than a decode
+        # error; either way the file is not a feed netrecon can read.
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise MissingFeed(f"CVE feed {feed_path} is not valid JSON: {exc}") from exc
         if not isinstance(data, dict):
             raise MissingFeed(

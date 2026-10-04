@@ -116,8 +116,14 @@ class RunState:
             raise StateError(f"no checkpoint found at {path}")
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StateError(f"could not read checkpoint {path}: {exc}") from exc
+        # A checkpoint that parses but is not an object is not a checkpoint:
+        # treating it as one turns a resume into an AttributeError mid-run.
+        if not isinstance(data, dict):
+            raise StateError(
+                f"checkpoint {path} is not a JSON object (found {type(data).__name__})"
+            )
         if data.get("state_version") != STATE_VERSION:
             raise StateError(
                 f"checkpoint {path} was written by an incompatible version "
@@ -133,8 +139,19 @@ class RunState:
             config_snapshot=data.get("config_snapshot") or {},
             finished_at=data.get("finished_at"),
         )
-        for name, stage_data in (data.get("stages") or {}).items():
-            state.stages[name] = StageState.from_dict({"name": name, **stage_data})
+        stages_data = data.get("stages") or {}
+        if not isinstance(stages_data, dict):
+            raise StateError(
+                f"checkpoint {path} has a 'stages' entry of type "
+                f"{type(stages_data).__name__}, expected an object"
+            )
+        for name, stage_data in stages_data.items():
+            if not isinstance(stage_data, dict):
+                raise StateError(
+                    f"checkpoint {path} has a malformed record for stage {name!r} "
+                    f"({type(stage_data).__name__}, expected an object)"
+                )
+            state.stages[str(name)] = StageState.from_dict({**stage_data, "name": str(name)})
         return state
 
     def save(self) -> None:
@@ -234,8 +251,23 @@ class RunState:
         self.save()
 
     def check_scope(self, fingerprint: str) -> None:
-        """Refuse to resume a run whose scope file has changed."""
-        if self.scope_fingerprint and self.scope_fingerprint != fingerprint:
+        """Refuse to resume a run whose scope cannot be shown to be unchanged.
+
+        An absent or empty fingerprint on either side is not "no change": it
+        means the authorised set cannot be verified, which is exactly when a
+        resume must not go ahead.
+        """
+        if not self.scope_fingerprint:
+            raise StateError(
+                "this checkpoint records no scope fingerprint, so the scope it was "
+                "authorised for cannot be verified; start a new run instead of resuming"
+            )
+        if not fingerprint:
+            raise StateError(
+                "no scope fingerprint was computed for this run, so it cannot be "
+                "checked against the checkpoint; start a new run instead of resuming"
+            )
+        if self.scope_fingerprint != fingerprint:
             raise StateError(
                 "the scope file has changed since this run was started; resuming "
                 "could scan hosts the earlier stages never authorised. Start a new "

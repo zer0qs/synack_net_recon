@@ -34,12 +34,31 @@ def read_json(path: str | Path, default: Any = None) -> Any:
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # A tool that wrote binary rubbish into a result file must degrade to
+        # "no data", exactly like a truncated or missing one.
         return default
 
 
 def write_lines(path: str | Path, lines: list[str]) -> Path:
+    """Write a line-per-entry artifact, atomically.
+
+    Same contract as :func:`write_json`: an interrupted or failing write must
+    leave either the previous file or no file, never a truncated host list that
+    a later stage would read as "these are all the live hosts".
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}-", suffix=".tmp", delete=False
+    )
+    try:
+        with handle:
+            handle.write("".join(f"{line}\n" for line in lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, path)
+    except BaseException:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
     return path

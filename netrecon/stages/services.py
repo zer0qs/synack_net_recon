@@ -115,7 +115,13 @@ def run(ctx: RunContext) -> StageResult:
         return _scan_host(ctx, target, os_detect=os_detect)
 
     outcomes = run_parallel(
-        targets, worker, concurrency=ctx.config.limits.concurrency, label="sV"
+        targets,
+        worker,
+        concurrency=ctx.config.limits.concurrency,
+        label="sV",
+        # One host that breaks the tool must not void the results collected
+        # from every other host in the batch.
+        on_error=lambda target, exc: (target, None, f"{type(exc).__name__}: {exc}"),
     )
 
     hosts: list[dict] = []

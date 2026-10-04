@@ -44,6 +44,7 @@ endpoint, bytes per response, requests per second, and per-request timeout.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import ssl
@@ -270,8 +271,12 @@ class GetOnlyClient:
                 reason = response.reason or ""
                 headers = {k.lower(): v for k, v in response.headers.items()}
         except urllib.error.HTTPError as exc:
-            # A 4xx/5xx is a result, not a failure.
-            body = exc.read(self._max_bytes + 1) if exc.fp else b""
+            # A 4xx/5xx is a result, not a failure. Reading the error body can
+            # itself fail on a server that lies about its own response.
+            try:
+                body = exc.read(self._max_bytes + 1) if exc.fp else b""
+            except (http.client.HTTPException, OSError, ValueError):
+                body = b""
             status, reason = exc.code, exc.reason or ""
             headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
         except urllib.error.URLError as exc:
@@ -279,6 +284,13 @@ class GetOnlyClient:
                 f"{type(exc.reason).__name__ if exc.reason else 'URLError'}: {exc.reason}"
             ) from exc
         except (TimeoutError, OSError, ValueError) as exc:
+            raise WebReconError(f"{type(exc).__name__}: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # A malformed status line, a header with no colon, more headers than
+            # http.client will accept, or a truncated chunked body all surface
+            # here. These are not OSErrors and urllib does not wrap them, so
+            # without this clause a broken server raises an exception type the
+            # stage does not expect and the whole run dies.
             raise WebReconError(f"{type(exc).__name__}: {exc}") from exc
 
         truncated = len(body) > self._max_bytes
@@ -525,7 +537,15 @@ def run(ctx: RunContext) -> StageResult:
     ctx.paths.webrecon_dir.mkdir(parents=True, exist_ok=True)
 
     def worker(endpoint: Endpoint) -> EndpointResult:
-        return _probe_endpoint(ctx, client, endpoint)
+        try:
+            return _probe_endpoint(ctx, client, endpoint)
+        except Exception as exc:  # noqa: BLE001
+            # run_parallel uses Executor.map, which is fail-fast: a single
+            # escaping exception discards the results of every other endpoint
+            # that already finished. A hostile host must not be able to erase
+            # the rest of the run, so the failure is recorded per endpoint.
+            log.warning("endpoint %s failed unexpectedly: %r", endpoint.label, exc)
+            return EndpointResult(endpoint, error=f"{type(exc).__name__}: {exc}")
 
     results = run_parallel(
         endpoints, worker, concurrency=min(cfg.concurrency, ctx.config.limits.concurrency),
@@ -878,9 +898,9 @@ def _probe_paths(
         }
         if classification == "accessible":
             record["preview"] = response.text[:1000]
-            name = re.sub(r"[^A-Za-z0-9._-]", "_", candidate.path.strip("/")) or "root"
+            name = _safe_filename(candidate.path.strip("/"), "root")
             (out_dir / "paths").mkdir(parents=True, exist_ok=True)
-            (out_dir / "paths" / name[:120]).write_bytes(response.body)
+            (out_dir / "paths" / name).write_bytes(response.body)
         elif classification == "redirected":
             record["location"] = response.headers.get("location")
         results.append(record)
@@ -918,7 +938,10 @@ def _fetch_source_maps(
             payload = None
 
         if isinstance(payload, dict) and isinstance(payload.get("sourcesContent"), list):
-            names = payload.get("sources") or []
+            # "sources" is a list per the source-map spec, but the target wrote
+            # this file: a dict there used to raise KeyError on names[index].
+            raw_names = payload.get("sources")
+            names = raw_names if isinstance(raw_names, list) else []
             for index, content in enumerate(payload["sourcesContent"][:50]):
                 if not isinstance(content, str) or not content.strip():
                     continue
@@ -966,7 +989,10 @@ def _same_endpoint_scripts(srcs: list[str], endpoint: Endpoint) -> list[str]:
             continue
         absolute = urljoin(base, candidate)
         parts = urlsplit(absolute)
-        if parts.scheme not in {"http", "https"}:
+        # An endpoint is (ip, port, scheme). A page that links
+        # https://<same ip>:<same port>/x.js names a *different* endpoint - one
+        # this worker was not authorised to open - so the scheme must match too.
+        if parts.scheme != endpoint.scheme:
             continue
         netloc = parts.netloc.lower()
         # Accept the bare host too, for a default-port URL.
@@ -980,9 +1006,25 @@ def _same_endpoint_scripts(srcs: list[str], endpoint: Endpoint) -> list[str]:
 
 
 def _save_script(out_dir: Path, url: str, body: bytes) -> None:
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", urlsplit(url).path.lstrip("/")) or "script.js"
+    name = _safe_filename(urlsplit(url).path.lstrip("/"), "script.js")
     (out_dir / "js").mkdir(parents=True, exist_ok=True)
-    (out_dir / "js" / name[:120]).write_bytes(body)
+    (out_dir / "js" / name).write_bytes(body)
+
+
+def _safe_filename(raw: str, fallback: str) -> str:
+    """A single filesystem-safe name for a path the *target* chose.
+
+    The path comes from the scanned host (its robots.txt, its sitemap, its
+    markup), so it is attacker-controlled. Replacing the separator is not
+    enough: ``/..`` and ``/.`` survive the substitution unchanged and then
+    name the parent directory, so ``write_bytes`` raises IsADirectoryError and
+    - because ``run_parallel`` is fail-fast - takes every other endpoint's
+    results down with it.
+    """
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:120]
+    if not name.strip(".") or name in {".", ".."}:
+        return fallback
+    return name
 
 
 def _correlate_cves(ctx: RunContext, results: list[EndpointResult]) -> list[dict[str, Any]]:

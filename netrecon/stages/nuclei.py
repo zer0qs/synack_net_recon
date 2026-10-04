@@ -82,7 +82,11 @@ def build_excluded_tags(extra: list[str] | None = None) -> list[str]:
 def build_target_list(ctx: RunContext) -> list[str]:
     """``ip:port`` endpoints from the sweep checkpoint, re-filtered by scope."""
     payload = read_json(ctx.paths.open_ports, default={}) or {}
-    hosts = payload.get("hosts") or {}
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, dict):
+        # A truncated or hand-edited checkpoint can hold a list here; treat it
+        # as no data rather than letting AttributeError escape the stage.
+        raise StageFailed(f"{ctx.paths.open_ports} is not in the expected format")
     enforced = ctx.scope.enforce(hosts.keys())
     allowed = set(enforced.allowed_str)
 

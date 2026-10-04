@@ -121,7 +121,13 @@ def run(ctx: RunContext) -> StageResult:
         return _scan_host(ctx, target, expression)
 
     outcomes = run_parallel(
-        targets, worker, concurrency=ctx.config.limits.concurrency, label="nse"
+        targets,
+        worker,
+        concurrency=ctx.config.limits.concurrency,
+        label="nse",
+        # One host that breaks the tool must not void the results collected
+        # from every other host in the batch.
+        on_error=lambda target, exc: (target, None, f"{type(exc).__name__}: {exc}"),
     )
 
     hosts: list[dict] = []
@@ -156,6 +162,12 @@ def run(ctx: RunContext) -> StageResult:
         merge_script_output(ctx.paths.services, hosts)
 
     log.info("collected %d script output(s) across %d host(s)", findings, len(hosts))
+
+    if not hosts and failures:
+        # Same contract as the services stage: if every host failed, the stage
+        # failed. Reporting "0 script outputs" as a completed stage reads as
+        # "nothing was found", which is not what happened.
+        raise StageFailed(f"every host failed NSE execution (first: {failures[0]})")
 
     return StageResult(
         counts={

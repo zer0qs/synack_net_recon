@@ -558,3 +558,48 @@ def test_category_grouping_is_stable_for_any_host_count(count):
     assert all(category.entries for category in categories), "no empty category may appear"
     if count:
         assert categories[0].key == "web"
+
+
+# -- regressions ---------------------------------------------------------
+
+
+def test_the_stage_timing_table_renders_with_a_non_empty_stages_block():
+    """A defensive read must not change what the expression means.
+
+    `payload.get("stages") or {}.items()` parses as
+    `(payload.get("stages")) or ({}.items())`, so a non-empty stages block
+    iterates the dict's keys and unpacking raises. Every real run has a
+    non-empty stages block, so this broke the report for all of them while a
+    fixture that happened to use `stages={}` kept passing.
+    """
+    artifacts = _artifacts(
+        stages={
+            "sweep": {
+                "status": "completed",
+                "duration_seconds": 1.2,
+                "detail": None,
+                "backend": "nmap",
+            },
+            "services": {
+                "status": "failed",
+                "duration_seconds": 0.4,
+                "detail": "nmap exited 1",
+                "backend": "nmap",
+            },
+        }
+    )
+    markdown, html = _render_both(artifacts)
+    assert "| sweep | completed |" in markdown.replace(" 1.2 ", " 1.2 ")
+    assert "sweep" in markdown and "services" in markdown
+    assert "nmap exited 1" in markdown
+    assert "<code>sweep</code>" in html
+
+
+def test_a_failed_stage_is_never_rendered_as_completed():
+    artifacts = _artifacts(
+        stages={"sweep": {"status": "failed", "duration_seconds": 0.1, "detail": "boom"}}
+    )
+    markdown, html = _render_both(artifacts)
+    assert "| sweep | failed |" in markdown
+    assert "| sweep | completed |" not in markdown
+    assert "boom" in markdown and "boom" in html

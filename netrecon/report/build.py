@@ -163,10 +163,29 @@ def aggregate(artifacts: Artifacts) -> Aggregate:
     Every cross-stage decision the report makes happens here.
     """
     summaries: dict[str, HostSummary] = {}
-    live_hosts = artifacts.live_hosts
+    in_scope = artifacts.in_scope
+
+    def authorised(ip: str | None) -> bool:
+        """Whether this address may appear in the report at all.
+
+        Every artifact is re-filtered on read, not just the ones produced by a
+        stage that talks to the network. A stale or hand-edited services.json
+        naming a host the run was never authorised to touch must not be able to
+        put that host in the deliverable - that is the invariant the rest of
+        the codebase enforces, and the report is the last place it can be lost.
+        An empty in-scope set means "not known" (``netrecon report`` on a run
+        with no scope snapshot) and disables the filter rather than dropping
+        everything.
+        """
+        return bool(ip) and (not in_scope or ip in in_scope)
+
+    live_hosts = [ip for ip in artifacts.live_hosts if authorised(ip)]
 
     # Ports from the sweep are the skeleton; service data enriches them.
-    for ip, entries in sorted((artifacts.sweep.get("hosts") or {}).items()):
+    sweep_hosts = artifacts.sweep.get("hosts")
+    for ip, entries in sorted((sweep_hosts or {}).items() if isinstance(sweep_hosts, dict) else []):
+        if not authorised(ip):
+            continue
         summary = summaries.setdefault(ip, HostSummary(ip))
         for entry in entries or []:
             if not isinstance(entry, dict):
@@ -186,7 +205,7 @@ def aggregate(artifacts: Artifacts) -> Aggregate:
         if not isinstance(host, dict):
             continue
         ip = host.get("address")
-        if not ip:
+        if not authorised(ip):
             continue
         summary = summaries.setdefault(ip, HostSummary(ip))
         summary.hostnames = list(host.get("hostnames") or [])
@@ -229,7 +248,7 @@ def aggregate(artifacts: Artifacts) -> Aggregate:
         if not isinstance(finding, dict):
             continue
         ip = _finding_ip(finding)
-        if ip is None:
+        if not authorised(ip):
             continue
         summary = summaries.setdefault(ip, HostSummary(ip))
         info = finding.get("info") or {}
@@ -248,7 +267,7 @@ def aggregate(artifacts: Artifacts) -> Aggregate:
         if not isinstance(result, dict):
             continue
         ip = result.get("ip")
-        if not ip or (artifacts.in_scope and ip not in artifacts.in_scope):
+        if not authorised(ip):
             continue
         summaries.setdefault(ip, HostSummary(ip)).web_endpoints.append(
             _web_endpoint_digest(result)
@@ -257,7 +276,7 @@ def aggregate(artifacts: Artifacts) -> Aggregate:
     from netrecon.stages.servicerecon import findings_by_host
 
     for ip, findings in findings_by_host(artifacts.service_findings).items():
-        if artifacts.in_scope and ip not in artifacts.in_scope:
+        if not authorised(ip):
             continue
         summaries.setdefault(ip, HostSummary(ip)).service_findings = findings
 
@@ -427,7 +446,7 @@ def render_markdown(
         "| --- | --- | --- | --- |",
     ]
 
-    for name, stage in payload.get("stages") or {}.items():
+    for name, stage in (payload.get("stages") or {}).items():
         if name == "report":
             # The reporting stage is still running while this table is rendered;
             # its own timing is recorded in state.json instead.
