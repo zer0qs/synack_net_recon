@@ -21,6 +21,13 @@ from netrecon.report.categories import Category
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
 
 
+def _dict_entries(value: Any) -> list[dict[str, Any]]:
+    """Only the mapping entries of *value*, or nothing."""
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
 def esc(value: Any) -> str:
     """HTML-escape any value, including quotes. ``None`` renders as a dash."""
     if value is None:
@@ -187,20 +194,23 @@ def render_html(
     service_findings: dict[str, Any] | None = None,
 ) -> str:
     """Render the complete report as one self-contained HTML document."""
-    run = payload["run"]
-    totals = payload["totals"]
-    title = f"netrecon report - {run['name']}"
+    # Same defensive reads as the markdown renderer: see the note there.
+    run = payload.get("run") or {}
+    totals = payload.get("totals") or {}
+    title = f"netrecon report - {run.get('name')}"
 
     tabs: list[tuple[str, str]] = [
         ("tab-overview", "Overview"),
         ("tab-hosts", f"By host ({len(hosts)})"),
         ("tab-categories", f"By service ({len(categories)})"),
     ]
-    findings_results = (service_findings or {}).get("results") or []
-    finding_total = sum(len(r.get("findings") or []) for r in findings_results)
+    # Both checkpoints are read back from disk and may hold anything; keep only
+    # the mapping entries so a truncated file degrades instead of raising.
+    findings_results = _dict_entries((service_findings or {}).get("results"))
+    finding_total = sum(len(_dict_entries(r.get("findings"))) for r in findings_results)
     if finding_total:
         tabs.insert(1, ("tab-findings", f"Findings ({finding_total})"))
-    web_results = (webrecon or {}).get("results") or []
+    web_results = _dict_entries((webrecon or {}).get("results"))
     if web_results:
         tabs.append(("tab-web", f"Web recon ({len(web_results)})"))
 
@@ -213,9 +223,9 @@ def render_html(
         "</head><body><div class='wrap'>",
         "<header class='page'>",
         "<h1>netrecon report</h1>",
-        f"<div class='sub'>Run <code>{esc(run['name'])}</code> &middot; started "
-        f"{esc(run['started_at'])} &middot; report generated "
-        f"{esc(payload['generated_at'])} (UTC)</div>",
+        f"<div class='sub'>Run <code>{esc(run.get('name'))}</code> &middot; started "
+        f"{esc(run.get('started_at'))} &middot; report generated "
+        f"{esc(payload.get('generated_at'))} (UTC)</div>",
         "</header>",
         "<div class='notice'><strong>Authorised engagement output.</strong> Everything "
         "below is an observation about an exposed service, not a verified "
@@ -268,21 +278,21 @@ def _render_stats(totals: dict[str, Any]) -> str:
         ("Notable observations", totals.get("notable_observations", 0)),
     ]
     if totals.get("web_endpoints"):
-        cells.append(("Web endpoints", totals["web_endpoints"]))
+        cells.append(("Web endpoints", totals.get("web_endpoints")))
     if totals.get("js_secret_candidates"):
-        cells.append(("JS secret candidates", totals["js_secret_candidates"]))
+        cells.append(("JS secret candidates", totals.get("js_secret_candidates")))
     if totals.get("service_findings"):
-        cells.append(("Service findings", totals["service_findings"]))
+        cells.append(("Service findings", totals.get("service_findings")))
     if totals.get("js_pii_candidates"):
-        cells.append(("PII candidates", totals["js_pii_candidates"]))
+        cells.append(("PII candidates", totals.get("js_pii_candidates")))
     if totals.get("paths_accessible"):
-        cells.append(("Paths accessible", totals["paths_accessible"]))
+        cells.append(("Paths accessible", totals.get("paths_accessible")))
     if totals.get("technologies"):
-        cells.append(("Technologies", totals["technologies"]))
+        cells.append(("Technologies", totals.get("technologies")))
     if totals.get("cve_matches"):
-        cells.append(("CVE correlations", totals["cve_matches"]))
+        cells.append(("CVE correlations", totals.get("cve_matches")))
     if totals.get("nuclei_findings"):
-        cells.append(("nuclei findings", totals["nuclei_findings"]))
+        cells.append(("nuclei findings", totals.get("nuclei_findings")))
 
     out = ["<div class='grid'>"]
     for key, value in cells:
@@ -295,13 +305,13 @@ def _render_stats(totals: dict[str, Any]) -> str:
 
 
 def _render_overview(payload: dict[str, Any]) -> str:
-    run = payload["run"]
-    scope = payload["scope"]
-    limits = payload["limits"]
+    run = payload.get("run") or {}
+    scope = payload.get("scope") or {}
+    limits = payload.get("limits") or {}
 
     rows = [
-        ("Run name", run["name"]),
-        ("Output directory", run["directory"]),
+        ("Run name", run.get("name")),
+        ("Output directory", run.get("directory")),
         ("Scope file", scope.get("source")),
         ("In-scope hosts", f"{scope.get('total_hosts')} "
                            f"(IPv4 {scope.get('ipv4_hosts')}, IPv6 {scope.get('ipv6_hosts')})"),
@@ -330,7 +340,7 @@ def _render_overview(payload: dict[str, Any]) -> str:
         "<section class='card'><table><thead><tr><th>Stage</th><th>Status</th>"
         "<th class='num'>Duration (s)</th><th>Backend</th><th>Detail</th></tr></thead><tbody>"
     )
-    for name, stage in payload["stages"].items():
+    for name, stage in (payload.get("stages") or {}).items():
         if name == "report":
             continue
         status = stage.get("status") or ""
@@ -372,10 +382,10 @@ def _render_parameter_index(payload: dict[str, Any]) -> str:
 
 def _render_findings(payload: dict[str, Any]) -> str:
     """The cross-host findings view: everything the analyzers concluded."""
-    results = payload.get("results") or []
+    results = _dict_entries(payload.get("results"))
     flat: list[dict[str, Any]] = []
     for result in results:
-        for finding in result.get("findings") or []:
+        for finding in _dict_entries(result.get("findings")):
             flat.append({**finding, **{
                 "ip": result.get("ip"),
                 "port": result.get("port"),
@@ -608,7 +618,7 @@ def _render_categories(categories: list[Category]) -> str:
 
 
 def _render_web(webrecon: dict[str, Any]) -> str:
-    results = webrecon.get("results") or []
+    results = _dict_entries(webrecon.get("results"))
     limits = webrecon.get("limits") or {}
 
     out = [
@@ -648,7 +658,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
             bits.append(f"redirects to {root['redirect_to']} (not followed)")
         out.append(f"<div class='sub'>{esc(' | '.join(bits))}</div>")
 
-        technologies = result.get("technologies") or []
+        technologies = _dict_entries(result.get("technologies"))
         if technologies:
             out.append(f"<h4>Technology stack ({len(technologies)})</h4><div>")
             for tech in technologies:
@@ -666,7 +676,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 out.append(f"<span class='tag web'>{esc(tech)}</span>")
             out.append("</div>")
 
-        cve_matches = result.get("cve_matches") or []
+        cve_matches = _dict_entries(result.get("cve_matches"))
         if cve_matches:
             out.append(f"<h4>CVE correlations ({len(cve_matches)})</h4>")
             out.append(
@@ -700,7 +710,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 out.append(f"<span class='tag'>{esc(name)}</span>")
             out.append("</div>")
 
-        well_known = [w for w in (result.get("well_known") or []) if w.get("status") == 200]
+        well_known = [w for w in (_dict_entries(result.get("well_known"))) if w.get("status") == 200]
         if well_known:
             out.append("<h4>Well-known files</h4>")
             for item in well_known:
@@ -723,7 +733,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 + "</pre></details>"
             )
 
-        paths = result.get("hidden_paths") or []
+        paths = _dict_entries(result.get("hidden_paths"))
         accessible = [p for p in paths if p.get("classification") == "accessible"]
         if paths:
             out.append(
@@ -764,7 +774,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
         javascript = result.get("javascript") or {}
         secrets = javascript.get("secret_candidates") or [
             secret
-            for script in result.get("scripts") or []
+            for script in _dict_entries(result.get("scripts"))
             for secret in (script.get("secret_candidates") or [])
         ]
         if secrets:
@@ -786,7 +796,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 "under <code>webrecon/</code> for manual verification.</p>"
             )
 
-        pii = javascript.get("pii_candidates") or []
+        pii = _dict_entries(javascript.get("pii_candidates"))
         if pii:
             summary = javascript.get("pii_summary") or {}
             out.append(f"<h4>Personal data candidates ({len(pii)})</h4>")
@@ -812,7 +822,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 )
             out.append("</tbody></table>")
 
-        infrastructure = javascript.get("infrastructure") or []
+        infrastructure = _dict_entries(javascript.get("infrastructure"))
         if infrastructure:
             out.append(f"<h4>Internal infrastructure referenced ({len(infrastructure)})</h4>")
             out.append("<table><thead><tr><th>Kind</th><th>Value</th><th>Source</th>"
@@ -845,7 +855,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 )
             out.append("</tbody></table>")
 
-        api_paths = javascript.get("endpoints") or []
+        api_paths = _dict_entries(javascript.get("endpoints"))
         if api_paths:
             out.append(
                 f"<details><summary>API surface referenced in front-end code "
@@ -877,7 +887,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 + "</pre></details>"
             )
 
-        script_errors = [s for s in result.get("scripts") or [] if s.get("error")]
+        script_errors = [s for s in _dict_entries(result.get("scripts")) if s.get("error")]
         if script_errors:
             out.append(
                 f"<details><summary>Scripts that could not be fetched "

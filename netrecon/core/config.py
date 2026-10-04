@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -64,6 +65,44 @@ class ConfigError(Exception):
     """The configuration is unusable."""
 
 
+def _number(value: Any, field_name: str, *, integer: bool, minimum: float = 1) -> Any:
+    """Validate a numeric setting, or refuse it with a readable error.
+
+    Every limit here is a guardrail, so a value that is not a usable number
+    must stop the run rather than reach a tool. Two shapes matter in practice:
+
+    * YAML quotes numbers easily (``masscan_rate: "1000"``), and a string would
+      otherwise raise ``TypeError`` deep inside a comparison; and
+    * ``nan`` compares false against everything, so a naive ``> MAXIMUM`` check
+      lets it straight through to an argv. It is rejected explicitly.
+
+    ``bool`` is refused too: ``True`` is ``1`` in Python, and a rate of 1 is
+    almost certainly not what someone writing ``true`` meant.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be a number, got a boolean")
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            raise ConfigError(f"{field_name} must be a number, got {value!r}") from None
+    if not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"{field_name} must be a number, got {type(value).__name__}"
+        )
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise ConfigError(f"{field_name} must be a finite number, got {value}")
+    if integer:
+        if float(value) != int(value):
+            raise ConfigError(f"{field_name} must be a whole number, got {value}")
+        value = int(value)
+    else:
+        value = float(value)
+    if value < minimum:
+        raise ConfigError(f"{field_name} must be >= {minimum:g}")
+    return value
+
+
 @dataclass
 class Limits:
     masscan_rate: int = 1_000
@@ -75,6 +114,19 @@ class Limits:
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
+
+        self.masscan_rate = _number(self.masscan_rate, "limits.masscan_rate", integer=True)
+        self.nuclei_rate = _number(self.nuclei_rate, "limits.nuclei_rate", integer=True)
+        self.concurrency = _number(self.concurrency, "limits.concurrency", integer=True)
+        self.nmap_timing = _number(
+            self.nmap_timing, "limits.nmap_timing", integer=True, minimum=0
+        )
+        self.host_timeout_seconds = _number(
+            self.host_timeout_seconds, "limits.host_timeout_seconds", integer=True
+        )
+        self.stage_timeout_seconds = _number(
+            self.stage_timeout_seconds, "limits.stage_timeout_seconds", integer=True
+        )
 
         if self.masscan_rate < 1:
             raise ConfigError("limits.masscan_rate must be >= 1")
@@ -372,6 +424,23 @@ class WebReconCfg:
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
+        self.max_endpoints = _number(self.max_endpoints, "webrecon.max_endpoints", integer=True)
+        self.max_scripts_per_endpoint = _number(
+            self.max_scripts_per_endpoint, "webrecon.max_scripts_per_endpoint", integer=True
+        )
+        self.max_response_bytes = _number(
+            self.max_response_bytes, "webrecon.max_response_bytes", integer=True
+        )
+        self.rate_per_second = _number(
+            self.rate_per_second, "webrecon.rate_per_second", integer=False, minimum=0.001
+        )
+        self.request_timeout_seconds = _number(
+            self.request_timeout_seconds, "webrecon.request_timeout_seconds", integer=True
+        )
+        self.concurrency = _number(self.concurrency, "webrecon.concurrency", integer=True)
+        self.max_hidden_paths = _number(
+            self.max_hidden_paths, "webrecon.max_hidden_paths", integer=True
+        )
         if self.max_endpoints < 1:
             raise ConfigError("webrecon.max_endpoints must be >= 1")
         if self.max_scripts_per_endpoint < 1:
@@ -449,8 +518,9 @@ class ServiceReconCfg:
                 self.analyzers = validate_names(list(self.analyzers))
             except UnknownAnalyzer as exc:
                 raise ConfigError(str(exc)) from exc
-        if self.probe_timeout_seconds < 1:
-            raise ConfigError("servicerecon.probe_timeout_seconds must be >= 1")
+        self.probe_timeout_seconds = _number(
+            self.probe_timeout_seconds, "servicerecon.probe_timeout_seconds", integer=True
+        )
         return []
 
 
@@ -460,8 +530,7 @@ class ScopeCfg:
     include_network_broadcast: bool = False
 
     def validate(self) -> list[str]:
-        if self.max_hosts < 1:
-            raise ConfigError("scope.max_hosts must be >= 1")
+        self.max_hosts = _number(self.max_hosts, "scope.max_hosts", integer=True)
         return []
 
 

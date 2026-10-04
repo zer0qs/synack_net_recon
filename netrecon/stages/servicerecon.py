@@ -223,10 +223,16 @@ def findings_by_host(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
     """Regroup service findings by host, for the report."""
     grouped: dict[str, list[dict[str, Any]]] = {}
     for result in payload.get("results") or []:
+        # A truncated or hand-edited checkpoint can hold nulls and non-objects;
+        # the report must survive reading one.
+        if not isinstance(result, dict):
+            continue
         ip = result.get("ip")
         if not ip:
             continue
         for finding in result.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
             grouped.setdefault(ip, []).append(
                 {
                     **finding,
@@ -244,7 +250,11 @@ def top_findings(payload: dict[str, Any], limit: int = 25) -> list[dict[str, Any
     """Most severe findings across the whole run, for the report summary."""
     flat: list[dict[str, Any]] = []
     for result in payload.get("results") or []:
+        if not isinstance(result, dict):
+            continue
         for finding in result.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
             flat.append(
                 {
                     **finding,

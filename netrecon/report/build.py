@@ -317,7 +317,7 @@ def _summary_payload(
     notable = sum(len(h.notes) for h in hosts)
     webrecon = artifacts.webrecon
     service_findings = artifacts.service_findings
-    web_results = webrecon.get("results") or []
+    web_results = [r for r in (webrecon.get("results") or []) if isinstance(r, dict)]
     return {
         "generated_at": utc_now(),
         "run": dict(artifacts.run),
@@ -371,10 +371,13 @@ def render_markdown(
     hosts: list[HostSummary],
     categories: list[categories_mod.Category] | None = None,
 ) -> str:
-    totals = payload["totals"]
-    scope = payload["scope"]
-    limits = payload["limits"]
-    run = payload["run"]
+    # Read defensively throughout. `netrecon report` is routinely pointed at an
+    # older or partially written run directory, and a missing metadata key must
+    # not destroy the deliverable the scan was run to produce.
+    totals = payload.get("totals") or {}
+    scope = payload.get("scope") or {}
+    limits = payload.get("limits") or {}
+    run = payload.get("run") or {}
 
     lines: list[str] = [
         "# netrecon report",
@@ -384,33 +387,33 @@ def render_markdown(
         "",
         "## Run",
         "",
-        f"- **Run name**: `{run['name']}`",
-        f"- **Started (UTC)**: {run['started_at']}",
+        f"- **Run name**: `{run.get('name')}`",
+        f"- **Started (UTC)**: {run.get('started_at')}",
         f"- **Report generated (UTC)**: {payload['generated_at']}",
-        f"- **Output directory**: `{run['directory']}`",
+        f"- **Output directory**: `{run.get('directory')}`",
         f"- **Scope file**: `{scope.get('source')}`",
-        f"- **Raw sockets**: {'yes' if run['raw_sockets'] else 'no (connect-scan fallback)'}",
-        f"- **Active stage (nuclei)**: {'enabled' if run['active_stage_enabled'] else 'disabled'}",
+        f"- **Raw sockets**: {'yes' if run.get('raw_sockets') else 'no (connect-scan fallback)'}",
+        f"- **Active stage (nuclei)**: {'enabled' if run.get('active_stage_enabled') else 'disabled'}",
         f"- **Sweep backend**: {payload.get('sweep_backend') or 'n/a'}",
-        f"- **Rate caps**: {limits['sweep_rate_pps']} pps sweep, "
-        f"{limits['nuclei_rate_rps']} rps nuclei, concurrency {limits['concurrency']}",
+        f"- **Rate caps**: {limits.get('sweep_rate_pps')} pps sweep, "
+        f"{limits.get('nuclei_rate_rps')} rps nuclei, concurrency {limits.get('concurrency')}",
         "",
         "## Totals",
         "",
         "| Metric | Count |",
         "| --- | --- |",
-        f"| In-scope addresses | {totals['in_scope_hosts']} |",
-        f"| Live hosts | {totals['live_hosts']} |",
-        f"| Hosts with open ports | {totals['hosts_with_open_ports']} |",
-        f"| Open ports | {totals['open_ports']} |",
-        f"| Services identified | {totals['services_identified']} |",
-        f"| nuclei findings | {totals['nuclei_findings']} |",
-        f"| Notable observations | {totals['notable_observations']} |",
+        f"| In-scope addresses | {totals.get('in_scope_hosts')} |",
+        f"| Live hosts | {totals.get('live_hosts')} |",
+        f"| Hosts with open ports | {totals.get('hosts_with_open_ports')} |",
+        f"| Open ports | {totals.get('open_ports')} |",
+        f"| Services identified | {totals.get('services_identified')} |",
+        f"| nuclei findings | {totals.get('nuclei_findings')} |",
+        f"| Notable observations | {totals.get('notable_observations')} |",
     ]
 
     if totals.get("web_endpoints"):
         lines += [
-            f"| Web endpoints probed | {totals['web_endpoints']} |",
+            f"| Web endpoints probed | {totals.get('web_endpoints')} |",
             f"| JavaScript files analysed | {totals.get('js_scripts_analysed', 0)} |",
             f"| Paths found in JavaScript | {totals.get('js_endpoints', 0)} |",
             f"| JS secret candidates | {totals.get('js_secret_candidates', 0)} |",
@@ -424,7 +427,7 @@ def render_markdown(
         "| --- | --- | --- | --- |",
     ]
 
-    for name, stage in payload["stages"].items():
+    for name, stage in payload.get("stages") or {}.items():
         if name == "report":
             # The reporting stage is still running while this table is rendered;
             # its own timing is recorded in state.json instead.
@@ -462,7 +465,7 @@ def render_markdown(
     if totals.get("cve_matches"):
         lines += [
             "",
-            f"**{totals['cve_matches']} CVE correlation(s)** from the configured feed.",
+            f"**{totals.get('cve_matches')} CVE correlation(s)** from the configured feed.",
             "These are version-to-feed matches, NOT verified exploitable conditions;",
             "confirm the exact build and patch level on each host before reporting.",
             "",
@@ -760,6 +763,8 @@ def _web_notes(host: HostSummary) -> list[str]:
     """Notable observations derived from the web recon stage."""
     notes: list[str] = []
     for endpoint in host.web_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
         port = endpoint.get("port")
         if endpoint.get("error"):
             continue
@@ -777,13 +782,13 @@ def _web_notes(host: HostSummary) -> list[str]:
                 f"assets ({kinds or 'mixed'}) - verify, then handle the run directory "
                 "as personal data"
             )
-        for path in endpoint.get("accessible_paths") or []:
+        for path in _as_dicts(endpoint.get("accessible_paths")):
             if path.get("high_value"):
                 notes.append(
                     f"`{port}/tcp` sensitive path accessible: `{path.get('path')}` "
                     f"- {path.get('reason')}"
                 )
-        for match in (endpoint.get("cve_matches") or [])[:5]:
+        for match in _as_dicts(endpoint.get("cve_matches"))[:5]:
             notes.append(
                 f"`{port}/tcp` feed correlation {match.get('cve_id')} against "
                 f"{match.get('technology')} {match.get('version') or ''} - unverified"
@@ -800,6 +805,17 @@ def _web_notes(host: HostSummary) -> list[str]:
                 f"{', '.join(sorted(disclosed))}"
             )
     return notes
+
+
+def _as_dicts(value: Any) -> list[dict[str, Any]]:
+    """Only the mapping entries of *value*, or nothing.
+
+    Checkpoints are read back from disk and may be truncated or hand-edited, so
+    a list field can hold anything. Rendering must degrade, not raise.
+    """
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
 
 
 def _tech_labels(technologies: list[Any], limit: int = 25) -> str:
