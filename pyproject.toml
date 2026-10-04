@@ -38,6 +38,9 @@ include = ["netrecon*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "e2e: end-to-end tests that bind a local HTTP server on 127.0.0.1 and let netrecon make real requests to it. Deselect with -m 'not e2e'.",
+]
 
 [tool.ruff]
 line-length = 100

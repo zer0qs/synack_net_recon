@@ -51,15 +51,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from netrecon.analyze import jsdata, techstack
+from netrecon.analyze import apistructure, jsdata, techstack
 from netrecon.analyze.jsdata import JsAnalysis
-from netrecon.core.jsonio import read_json, write_json
+from netrecon.core.jsonio import read_json, write_json, write_lines
 from netrecon.core.runner import RunContext, run_parallel
 from netrecon.core.state import utc_now
 from netrecon.report.categories import is_tls, is_web_service
@@ -250,15 +251,16 @@ class GetOnlyClient:
 
     def get(self, url: str) -> HttpResponse:
         self._limiter.wait()
+        headers = {
+            "User-Agent": self._user_agent,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
         request = urllib.request.Request(  # noqa: S310 - scheme checked by caller
             url,
             method="GET",
-            headers={
-                "User-Agent": self._user_agent,
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-                "Connection": "close",
-            },
+            headers=headers,
         )
         started = time.monotonic()
         try:
@@ -273,7 +275,9 @@ class GetOnlyClient:
             status, reason = exc.code, exc.reason or ""
             headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
         except urllib.error.URLError as exc:
-            raise WebReconError(f"{type(exc.reason).__name__ if exc.reason else 'URLError'}: {exc.reason}") from exc
+            raise WebReconError(
+                f"{type(exc.reason).__name__ if exc.reason else 'URLError'}: {exc.reason}"
+            ) from exc
         except (TimeoutError, OSError, ValueError) as exc:
             raise WebReconError(f"{type(exc).__name__}: {exc}") from exc
 
@@ -348,6 +352,15 @@ class EndpointResult:
     js: dict[str, Any] = field(default_factory=dict)
     technologies: list[dict[str, Any]] = field(default_factory=list)
     cve_matches: list[dict[str, Any]] = field(default_factory=list)
+    #: Reconstructed API endpoints for this web endpoint, richest first.
+    api_endpoints: list[dict[str, Any]] = field(default_factory=list)
+    #: The raw call sites, kept for run-level merging. Not serialised: the
+    #: per-endpoint view above is what the report needs.
+    raw_call_sites: list[Any] = field(default_factory=list, repr=False)
+
+    @property
+    def call_sites(self) -> int:
+        return len(self.raw_call_sites)
     error: str | None = None
 
     def _js_total(self, key: str) -> int:
@@ -382,6 +395,7 @@ class EndpointResult:
             "hidden_paths": self.hidden_paths,
             "scripts": self.scripts,
             "javascript": self.js,
+            "api_endpoints": self.api_endpoints,
             "technologies": self.technologies,
             "cve_matches": self.cve_matches,
             "totals": {
@@ -392,6 +406,8 @@ class EndpointResult:
                 "paths_accessible": len(self.accessible_paths),
                 "technologies": len(self.technologies),
                 "cve_matches": len(self.cve_matches),
+                "api_endpoints": len(self.api_endpoints),
+                "call_sites": self.call_sites,
             },
         }
 
@@ -541,6 +557,9 @@ def run(ctx: RunContext) -> StageResult:
     )
     cve_matches = [m for r in reachable for m in r.cve_matches]
 
+    # Merge the per-endpoint API reconstruction into one view of the whole run.
+    api = _merge_api(reachable)
+
     # Correlate detected versions against the operator's local CVE feed, if any.
     if cfg.cve_feed:
         cve_matches = _correlate_cves(ctx, reachable)
@@ -577,18 +596,26 @@ def run(ctx: RunContext) -> StageResult:
             "technologies": technologies,
             "hosts_referenced": hosts_referenced,
             "cve_matches": len(cve_matches),
+            "api_endpoints": len(api["endpoints"]),
+            "api_parameters": len(api["parameters"]),
+            "api_structure": api["structure"],
+            "parameters": api["parameters"],
+            "api_call_sites": api["call_sites"],
             "failures": failures,
             "results": [r.to_dict() for r in results],
         },
     )
+    _write_api_artifacts(ctx, api, total_pii, total_secrets, reachable)
 
     log.info(
         "web recon: %d/%d endpoint(s) reachable, %d asset(s) analysed, "
-        "%d API path(s), %d technolog(ies)",
+        "%d API endpoint(s) from %d call site(s), %d parameter(s), %d technolog(ies)",
         len(reachable),
         len(results),
         total_scripts,
-        total_endpoints,
+        len(api["endpoints"]),
+        api["call_sites"],
+        len(api["parameters"]),
         len(technologies),
     )
     if total_secrets:
@@ -626,6 +653,8 @@ def run(ctx: RunContext) -> StageResult:
             "technologies": len(technologies),
             "cve_matches": len(cve_matches),
             "hosts_referenced": len(hosts_referenced),
+            "api_endpoints": len(api["endpoints"]),
+            "api_parameters": len(api["parameters"]),
             "failures": len(failures),
         },
         outputs={"webrecon": ctx.paths.webrecon},
@@ -733,57 +762,71 @@ def _probe_endpoint(
 
     # --- JavaScript and front-end assets -------------------------------
     analyses: list[JsAnalysis] = []
+    call_sites: list[apistructure.CallSite] = []
+
+    def record(body: str, source: str, *, truncated: bool = False) -> JsAnalysis:
+        """Run both analyses over one body and keep the results together."""
+        analysis = jsdata.analyse_javascript(
+            body, source=source, redact=cfg.redact_secrets, truncated=truncated
+        )
+        analyses.append(analysis)
+        call_sites.extend(apistructure.analyse_api(body, source=source))
+        return analysis
 
     # The page itself is analysed without any further request: inline scripts,
     # and any sensitive data pasted straight into the markup.
-    analyses.append(
-        jsdata.analyse_javascript(body_text, source="(page)", redact=cfg.redact_secrets)
-    )
+    record(body_text, "(page)")
     for index, inline in enumerate(parser.inline_scripts[: cfg.max_scripts_per_endpoint]):
-        analyses.append(
-            jsdata.analyse_javascript(
-                inline, source=f"inline#{index + 1}", redact=cfg.redact_secrets
-            )
-        )
+        record(inline, f"inline#{index + 1}")
         result.scripts.append({"source": f"inline#{index + 1}", "bytes": len(inline)})
 
-    remaining = cfg.max_scripts_per_endpoint - len(result.scripts)
+    # Crawl: start from the scripts the page linked, then follow further .js
+    # references found inside each fetched body. Bounded by the script budget,
+    # and restricted to this one in-scope endpoint throughout.
+    queue: list[str] = _same_endpoint_scripts(parser.script_srcs, endpoint)
+    fetched: set[str] = set()
     source_maps: list[str] = []
-    if remaining > 0:
-        for src in _same_endpoint_scripts(parser.script_srcs, endpoint)[:remaining]:
-            try:
-                response = client.get(src)
-            except WebReconError as exc:
-                result.scripts.append({"source": src, "error": str(exc)})
-                continue
-            if response.status != 200 or not response.body:
-                result.scripts.append({"source": src, "status": response.status})
-                continue
-            analysis = jsdata.analyse_javascript(
-                response.text,
-                source=src,
-                redact=cfg.redact_secrets,
-                truncated=response.truncated,
-            )
-            analyses.append(analysis)
-            source_maps += analysis.source_maps
-            result.scripts.append(
-                {
-                    "source": src,
-                    "status": response.status,
-                    "bytes": len(response.body),
-                    "truncated": response.truncated,
-                    "endpoints": [e.value for e in analysis.endpoints],
-                    "secret_candidates": [s.to_dict() for s in analysis.secrets],
-                }
-            )
-            _save_script(out_dir, src, response.body)
+
+    while queue and len(result.scripts) < cfg.max_scripts_per_endpoint:
+        src = queue.pop(0)
+        if src in fetched:
+            continue
+        fetched.add(src)
+        try:
+            response = client.get(src)
+        except WebReconError as exc:
+            result.scripts.append({"source": src, "error": str(exc)})
+            continue
+        if response.status != 200 or not response.body:
+            result.scripts.append({"source": src, "status": response.status})
+            continue
+
+        analysis = record(response.text, src, truncated=response.truncated)
+        source_maps += analysis.source_maps
+        result.scripts.append(
+            {
+                "source": src,
+                "status": response.status,
+                "bytes": len(response.body),
+                "truncated": response.truncated,
+                "endpoints": [e.value for e in analysis.endpoints],
+                "secret_candidates": [s.to_dict() for s in analysis.secrets],
+            }
+        )
+        _save_script(out_dir, src, response.body)
+
+        if cfg.crawl_scripts:
+            for found in _same_endpoint_scripts(_js_references(response.text), endpoint):
+                if found not in fetched and found not in queue:
+                    queue.append(found)
 
     # Source maps carry the original, unminified sources - usually the richest
     # single artifact a front-end hands out.
     if cfg.fetch_source_maps and source_maps:
-        analyses += _fetch_source_maps(ctx, client, endpoint, source_maps, out_dir, result)
+        _fetch_source_maps(ctx, client, endpoint, source_maps, out_dir, result, record)
 
+    result.raw_call_sites = call_sites
+    result.api_endpoints = [e.to_dict() for e in apistructure.group_endpoints(call_sites)]
     result.js = jsdata.merge_analyses(analyses)
     if not cfg.detect_pii:
         result.js["pii_candidates"] = []
@@ -851,9 +894,14 @@ def _fetch_source_maps(
     source_maps: list[str],
     out_dir: Path,
     result: EndpointResult,
-) -> list[JsAnalysis]:
-    """Fetch same-endpoint .map files and analyse their embedded sources."""
-    analyses: list[JsAnalysis] = []
+    record: Callable[..., Any],
+) -> None:
+    """Fetch same-endpoint .map files and analyse their embedded sources.
+
+    A source map carries ``sourcesContent``: the original, unminified files.
+    Analysing those beats analysing the bundle, so each embedded source is fed
+    through the same ``record`` callback as a real file.
+    """
     for url in _same_endpoint_scripts(sorted(set(source_maps)), endpoint)[:5]:
         try:
             response = client.get(url)
@@ -868,31 +916,36 @@ def _fetch_source_maps(
             payload = json.loads(body)
         except json.JSONDecodeError:
             payload = None
-        # sourcesContent holds the original files; analysing those beats
-        # analysing the minified bundle.
+
         if isinstance(payload, dict) and isinstance(payload.get("sourcesContent"), list):
             names = payload.get("sources") or []
             for index, content in enumerate(payload["sourcesContent"][:50]):
                 if not isinstance(content, str) or not content.strip():
                     continue
                 name = names[index] if index < len(names) else f"source#{index}"
-                analyses.append(
-                    jsdata.analyse_javascript(
-                        content,
-                        source=f"{url} -> {name}",
-                        redact=ctx.config.webrecon.redact_secrets,
-                    )
-                )
+                record(content, f"{url} -> {name}")
         else:
-            analyses.append(
-                jsdata.analyse_javascript(
-                    body, source=url, redact=ctx.config.webrecon.redact_secrets
-                )
-            )
+            record(body, url)
+
         result.scripts.append(
             {"source": url, "status": response.status, "bytes": len(response.body)}
         )
-    return analyses
+
+
+#: Further ``.js`` references inside an already-fetched body, for the crawl.
+_JS_REFERENCE_RE = re.compile(r"""["'`](/?[A-Za-z0-9_\-./]{1,200}\.js)(?:\?[^"'`]{0,80})?["'`]""")
+
+
+def _js_references(body: str, limit: int = 60) -> list[str]:
+    """Script URLs mentioned inside a body, for one more crawl hop."""
+    found: list[str] = []
+    for match in _JS_REFERENCE_RE.finditer(body):
+        value = match.group(1)
+        if value not in found:
+            found.append(value)
+        if len(found) >= limit:
+            break
+    return found
 
 
 def _same_endpoint_scripts(srcs: list[str], endpoint: Endpoint) -> list[str]:
@@ -973,3 +1026,87 @@ def _tech_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         if key in kwargs and isinstance(kwargs[key], list):
             kwargs[key] = tuple(kwargs[key])
     return kwargs
+
+
+def _merge_api(results: list[EndpointResult]) -> dict[str, Any]:
+    """Fold every endpoint's reconstruction into one API view for the run.
+
+    Regrouping from the raw call sites rather than merging already-grouped
+    dicts keeps one code path for the grouping rules, so a parameter seen on
+    two different web endpoints is merged exactly as one seen twice on one.
+    """
+    call_sites = apistructure.merge_call_sites([r.raw_call_sites for r in results])
+    endpoints = apistructure.group_endpoints(call_sites)
+    parameters = apistructure.build_parameter_index(endpoints)
+    return {
+        "endpoints": [e.to_dict() for e in endpoints],
+        "endpoint_objects": endpoints,
+        "parameters": [p.to_dict() for p in parameters],
+        "parameter_objects": parameters,
+        "structure": apistructure.api_structure(call_sites),
+        "call_sites": len(call_sites),
+    }
+
+
+def _write_api_artifacts(
+    ctx: RunContext,
+    api: dict[str, Any],
+    pii_count: int,
+    secret_count: int,
+    results: list[EndpointResult],
+) -> None:
+    """Write the standalone API and parameter artifacts.
+
+    ``parameters.txt`` is a plain wordlist on purpose: it is meant to be piped
+    straight into a parameter-mining or fuzzing tool during the testing phase
+    that follows reconnaissance.
+    """
+    write_json(ctx.paths.api_structure, api["structure"])
+    write_json(ctx.paths.parameters_json, {"parameters": api["parameters"]})
+
+    write_lines(
+        ctx.paths.api_endpoints,
+        apistructure.endpoint_lines(api["endpoint_objects"]),
+    )
+    write_lines(
+        ctx.paths.js_endpoints,
+        sorted(
+            {
+                str(entry.get("value"))
+                for r in results
+                for entry in (r.js.get("endpoints") or [])
+                if entry.get("value")
+            }
+        ),
+    )
+    write_lines(
+        ctx.paths.parameters_txt,
+        apistructure.parameter_wordlist(api["parameter_objects"]),
+    )
+
+    write_json(
+        ctx.paths.js_findings,
+        {
+            "generated_at": utc_now(),
+            "endpoints": sorted(
+                {
+                    str(entry.get("value"))
+                    for r in results
+                    for entry in (r.js.get("endpoints") or [])
+                    if entry.get("value")
+                }
+            ),
+            "api_structure": api["structure"],
+            "parameters": api["parameters"],
+            "secrets": [
+                s for r in results for s in (r.js.get("secret_candidates") or [])
+            ],
+            "pii": [p for r in results for p in (r.js.get("pii_candidates") or [])],
+            "totals": {
+                "secrets": secret_count,
+                "pii": pii_count,
+                "api_endpoints": len(api["endpoints"]),
+                "parameters": len(api["parameters"]),
+            },
+        },
+    )

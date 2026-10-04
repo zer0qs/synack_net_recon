@@ -231,6 +231,9 @@ endpoint, 120 curated paths per endpoint (hard max 400), 2 MiB per response (har
 - **Source maps.** `.map` files referenced by scripts are fetched and their
   `sourcesContent` analysed — the original unminified sources, which routinely contain
   things the bundle does not.
+- **Crawled scripts.** Further `.js` references found inside fetched scripts are followed,
+  so lazy-loaded chunks are covered, not just what the landing page linked. Same in-scope
+  endpoint only, bounded by the script budget.
 - **Hidden files and folders** (`--hidden-paths`). A curated ~120-entry list of
   commonly exposed paths: `.git/HEAD`, `.env`, `appsettings.json`, `/actuator/env`,
   backups, dumps, `swagger.json`, `/server-status`, editor and CI leftovers. Each entry
@@ -239,21 +242,68 @@ endpoint, 120 curated paths per endpoint (hard max 400), 2 MiB per response (har
   summary, and will appear as 404s in the target's access log. It is capped at 400 entries
   in code and is not, and must not become, a brute-force wordlist.
 
-### JavaScript analysis
+### API surface reconstruction
+
+`netrecon/analyze/apistructure.py` does not list paths — it reconstructs a **call
+signature** per endpoint, which is testable attack surface in a way a path list is not.
+
+Recognised call sites: `fetch(url, opts)`, `axios.<verb>(url, data)`,
+`axios({url, method, params})`, `$.get/$.post/$.getJSON`, `$.ajax({url, type, data})`,
+generic `<client>.<verb>(url, data)`, and `xhr.open(method, url)`. Per call site it
+recovers:
+
+| Recovered | From |
+| --- | --- |
+| **method** | the verb, else `method:`/`type:` in the options object, else GET |
+| **query params** | the URL's own query string, plus a `params:` object |
+| **path params** | `${userId}` template expressions and `/:id` segments |
+| **body params** | keys of `body`/`data`/`json`/`variables`, `JSON.stringify({...})`, or a bare second-argument object |
+| **source + line** | for traceability back to the file |
+
+Object keys are read **in source order**, handling `key:` and shorthand `{a, b}`.
+Transport options (`method`, `headers`, `credentials`, …) are filtered **only at the top
+level**, so a GraphQL body legitimately keeps its `query` and `variables` keys. Nested
+option objects cannot leak: a brace-aware scanner strips `headers: {Authorization: …}`
+before top-level keys are read, so `Authorization` is structurally incapable of being
+reported as a parameter — not merely filtered out afterwards.
+
+Call sites are then grouped per endpoint into merged `methods`, `query_params`,
+`path_params`, `body_params`, `param_count`, `call_sites`, `sources`, a `refs` list for
+traceability, a short `source_label` (`app.js +1`) and a readable `signature`:
+
+```
+GET/POST /api/v2/orders?page={page}&size={size}&status={status}
+PUT      /api/v2/users/{userId}/roles
+```
+
+Endpoints sort richest-first. Outputs: `api_structure.json`, `api_endpoints.txt`,
+`js_endpoints.txt`.
+
+### Parameter index
+
+Every parameter across every endpoint is flattened into
+`{name, kinds[body|query|path], endpoints, occurrences, endpoint_count}`, sorted
+most-widely-accepted first — the ordering that matters for mass-assignment testing, since
+a name accepted by six endpoints is a better candidate than one accepted by one.
+Outputs: `parameters.json`, and `parameters.txt` as a plain wordlist, one name per line,
+ready to pipe into a parameter miner or fuzzer.
+
+### Secrets, PII and infrastructure
 
 `netrecon/analyze/jsdata.py` runs over every asset — the page, inline scripts, linked
 scripts and source-map sources:
 
 | Extracted | Detail |
 | --- | --- |
-| **API surface** | Paths and absolute URLs, with the HTTP method where the call site reveals it (`axios.post(...)`, `fetch(..., {method})`, `xhr.open("PUT", ...)`). Template paths (`/users/${id}`) are kept. Static assets are excluded. |
-| **Secrets** | AWS/Google/Slack/GitHub/GitLab/Stripe/Twilio/SendGrid/npm/OpenAI key shapes, JWTs, private-key headers, credentials in URLs, connection strings, and `api_key = "…"` assignments |
-| **PII** | Emails, phone numbers, credit cards (**Luhn-validated**), IBAN, SSN and national-ID shapes |
+| **Secrets** | ~24 named rules: AWS access and secret keys, Google API key and OAuth id, Slack token and webhook, GitHub/GitLab tokens, Stripe, Twilio, SendGrid, Mailgun, npm, OpenAI, Azure storage keys, GCP service accounts, Firebase config, JWTs, private-key blocks, bearer and basic auth headers, credentials in URLs, connection strings, and `api_key = "…"` assignments |
+| **PII** | Emails, E.164 phone numbers, credit cards (**Luhn-validated**, with issuer prefixes as a confidence signal), IBAN, SSN, national-ID shapes, and S3 bucket hosts |
 | **Infrastructure** | Internal hostnames (`.internal`, `.corp`, `staging.`, `jenkins.`…), private addresses, cloud metadata endpoints |
 | **Other** | Source maps, developer comments (TODO/FIXME/"do not ship"), every host referenced |
 
 **Everything sensitive is masked by default.** A secret renders as
-`9f2b********e8 (len 32)`, an email as `al*****@acme.vn`, a card as `************1111`.
+`9f2b7c…d2e8 (len 32)`, an email as `al*****@acme.vn`, a card as `************1111`.
+Context windows are redacted against *every* value found, including fragments cut off at
+the window edge, so a secret cannot leak through its neighbour's context.
 The full bodies are saved under `webrecon/` for verification. For PII the *count and kind*
 are the finding — a bundle containing 4,000 customer addresses is the thing to report;
 printing those addresses into a deliverable just moves the breach. `redact_secrets: false`
@@ -339,17 +389,31 @@ Every run writes three views of the same data:
 | `report.md` | Terminal, diffs, pasting into notes |
 | `report.html` | A single self-contained page for reading and sharing |
 
-`report.html` has four tabs:
+Report aggregation is a **pure function** of the collected artifacts
+(`report.build.aggregate`): plain data in, plain data out, with no file access and no
+`RunContext`. That is what makes the cross-stage reasoning directly unit-testable, and
+`tests/test_aggregate.py` calls it with literal dicts.
 
-1. **Overview** — run parameters, scope bounds, rate caps, per-stage timings.
-2. **By host** — each host with its ports, versions, NSE output, nuclei findings and notes,
-   with a live filter box.
-3. **By service** — the same ports regrouped into categories: web, databases, remote access,
+`report.html` has up to five tabs:
+
+1. **Overview** — run parameters, scope bounds, rate caps, per-stage timings, and the
+   run-wide parameter index.
+2. **Findings** — every analyzer finding across every host, sorted by severity, with the
+   evidence behind each one and a live filter box.
+3. **By host** — each host with its ports, versions, NSE output, service findings, nuclei
+   findings and notes.
+4. **By service** — the same ports regrouped into categories: web, databases, remote access,
    file sharing, directory, mail, management, messaging, infrastructure, other. Service name
    from `-sV` wins; the port table is only a fallback, so a web server on 3306 is reported as
    a web service. Rows link back to the host section.
-4. **Web recon** — per endpoint: status, title, technologies, disclosure and missing security
-   headers, well-known files, forms found, and the JavaScript analysis.
+5. **Web recon** — per endpoint: status, title, technology stack with versions, CVE
+   correlations, security headers, paths checked, the reconstructed API surface, and the
+   full JavaScript analysis.
+
+The method notice at the top of the web tab states what was actually requested, including
+whether `--hidden-paths` ran. It tracks the real configuration rather than asserting a fixed
+claim — a report that said "no path brute forcing" after path probing ran would
+misrepresent what was done to the target, and there is a test for exactly that.
 
 The page has **no external resources** — styles and scripts are inline, so opening it on a
 client network does not phone home. Everything interpolated into it is HTML-escaped: page
@@ -483,7 +547,7 @@ scripts:
 
 nuclei:
   templates: [network/]
-  severity: info,low,medium,high,critical
+  severity: low,medium,high,critical
 ```
 
 CLI flags override the config file, and the result is re-validated (so clamping and warnings
@@ -537,7 +601,13 @@ results/<run_name>/<UTC-timestamp>/
 ├── nuclei.json           # nuclei JSONL (only with --active)
 ├── nuclei_summary.json   # finding counts by severity
 ├── webrecon.json         # web recon + JS analysis (only with --web)
-├── webrecon/             # saved response bodies and fetched .js, per endpoint
+├── webrecon/             # saved bodies, fetched .js and probed paths, per endpoint
+├── api_structure.json    # reconstructed endpoints with methods and parameters
+├── api_endpoints.txt     # one signature per line
+├── js_endpoints.txt      # every path and URL seen in front-end code
+├── parameters.json       # parameter index with kinds and endpoint counts
+├── parameters.txt        # plain wordlist, one parameter name per line
+├── js_findings.json      # endpoints + api_structure + parameters + secrets + PII
 ├── summary.json          # PRIMARY machine-readable aggregate
 ├── report.md             # host → ports → service/version → notable findings
 ├── report.html           # self-contained: by host, by service category, web recon
@@ -606,28 +676,41 @@ host's networks. The image bundles nmap, masscan, fping, naabu and nuclei.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q            # ~1000 tests, no network access
+pytest -q                 # ~1260 tests
+pytest -q -m "not e2e"    # the hermetic subset: no sockets at all
+pytest -q -m e2e          # just the end-to-end tests
 ruff check .
 ```
 
-The suite performs **no live scanning**. Coverage focuses on the parts where a bug becomes a
-safety problem:
+Most of the suite is hermetic: subprocess calls are monkeypatched, the web stage's HTTP
+client is replaced by a fake that records every URL it is asked for, and no socket is
+opened. The `e2e` tests are the exception — they bind a fixture application to
+`127.0.0.1` and let netrecon make real requests to it, because crawling, source-map
+following and artifact generation only prove themselves when the whole chain runs.
+Nothing external is ever contacted, and the stages that need nmap skip themselves when it
+is absent.
+
+Coverage concentrates on the places where a bug becomes a safety problem:
 
 | File | Covers |
 | --- | --- |
 | `tests/test_scope.py` | CIDR/range expansion, rejection, enforcement, fingerprints |
-| `tests/test_parse_nmap.py` | nmap XML parsing, from recorded fixtures |
-| `tests/test_parse_masscan.py` | masscan JSON/list and naabu JSON, including truncated output |
-| `tests/test_guardrails.py` | Rate clamping, NSE policy, template policy, privilege detection |
 | `tests/test_stage_scope_enforcement.py` | Every stage re-filters its inputs; tampered checkpoints |
-| `tests/test_state_and_report.py` | Checkpoint/resume, pre-flight banner, report aggregation |
+| `tests/test_guardrails.py` | Rate clamping, NSE policy, template policy, privilege detection |
+| `tests/test_nuclei.py` | Mandatory tag exclusions, clamps, and per-finding scope filtering |
+| `tests/test_parse_nmap.py`, `test_parse_masscan.py` | Tool output parsing, including truncated files |
+| `tests/test_analyze_apistructure.py` | Call-site parsing — including that request headers can never become parameters |
+| `tests/test_analyze_jsdata.py` | Secret/PII/infrastructure rules, with a "does not fire" case beside every pattern |
+| `tests/test_analyze_*.py` | One suite per service analyzer, built from recorded NSE output |
+| `tests/test_wellknown.py` | The curated path list, including an assertion that it stays curated |
+| `tests/test_servicerecon.py` | The offline guarantee, evidence assembly, analyzer registry |
+| `tests/test_aggregate.py` | Report aggregation as a pure function, called with literal dicts |
 | `tests/test_categories.py` | Service categorisation and the per-category grouping |
-| `tests/test_webrecon.py` | JS analysis, secret masking, and that the web stage stays on the authorised endpoint |
 | `tests/test_report_html.py` | HTML structure, no external resources, escaping of hostile host-supplied strings |
+| `tests/test_state_and_report.py` | Checkpoint/resume and the pre-flight banner |
+| `tests/test_end_to_end.py` | The whole chain against a live fixture server |
 
-Fixtures in `tests/fixtures/` are recorded tool output; subprocess calls are monkeypatched,
-and the web stage's HTTP client is replaced with a fake that records every URL it is asked
-for - so the "only these paths may be requested" guarantee is asserted, not assumed.
+Fixtures in `tests/fixtures/` are recorded tool output.
 
 ## Module layout
 
@@ -660,7 +743,8 @@ netrecon/
 │   ├── snmp.py  dns.py  mail.py  httpsvc.py
 │   ├── techstack.py        # product + version + CPE fingerprinting
 │   ├── cve.py              # offline CVE feed correlation
-│   └── jsdata.py           # API / secrets / PII / infrastructure from front-end code
+│   ├── apistructure.py     # call-site parsing -> endpoint signatures + parameter index
+│   └── jsdata.py           # secrets / PII / infrastructure from front-end code
 ├── parse/
 │   ├── nmap.py             # nmap XML -> dataclasses
 │   └── masscan.py          # masscan JSON/list, naabu JSON

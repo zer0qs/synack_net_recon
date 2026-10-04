@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 # -- limits --------------------------------------------------------------
@@ -128,14 +128,21 @@ class JsAnalysis:
 # -- masking -------------------------------------------------------------
 
 
+#: Separator between the revealed head and tail of a masked secret.
+MASK_ELLIPSIS = "…"
+
+
 def mask_value(value: str) -> str:
-    """Mask a value, keeping enough to find it again in the saved body."""
+    """Mask a value as ``first six + … + last four``, e.g. ``AKIAZZ…N42X``.
+
+    The head and tail are what let an operator find the value again in the body
+    saved under the run directory. A short value has no room to give that away,
+    so it reveals at most the first two characters and nothing from the tail.
+    """
     text = str(value)
-    if len(text) <= 6:
-        return text[:1] + "*" * max(len(text) - 1, 0)
     if len(text) <= 12:
-        return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
-    return f"{text[:4]}{'*' * 8}{text[-2:]} (len {len(text)})"
+        return f"{text[:2]}{'*' * max(len(text) - 2, 0)}"
+    return f"{text[:6]}{MASK_ELLIPSIS}{text[-4:]} (len {len(text)})"
 
 
 def mask_email(value: str) -> str:
@@ -273,6 +280,62 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sendgrid_key", re.compile(r"\b(SG\.[0-9A-Za-z_\-]{20,}\.[0-9A-Za-z_\-]{20,})\b")),
     ("npm_token", re.compile(r"\b(npm_[0-9A-Za-z]{36})\b")),
     ("openai_key", re.compile(r"\b(sk-(?:proj-)?[0-9A-Za-z_\-]{20,})\b")),
+    ("mailgun_key", re.compile(r"(?<![\w\-])(key-[0-9a-fA-F]{32})\b")),
+    (
+        # The marker, not the key body: a service-account blob is thousands of
+        # characters and reporting it would be the credential dump this module
+        # exists to avoid. Requiring the private key to actually start with a
+        # PEM header is what separates a live blob from a templated one.
+        "gcp_service_account",
+        re.compile(
+            r"""(["']type["']\s*:\s*["']service_account["'])"""
+            r"""(?=[\s\S]{0,4000}?["']private_key["']\s*:\s*["'](?:\\n)?-----BEGIN)"""
+        ),
+    ),
+    (
+        # apiKey next to authDomain/projectId: either alone is too weak, the
+        # pair is a Firebase web config. The captured value is the key itself,
+        # so a config full of placeholders is filtered like any other.
+        "firebase_config",
+        re.compile(
+            r"""apiKey["']?\s*[:=]\s*["']([^"'\s]{8,160})["']"""
+            r"""(?=[^{}]{0,400}?(?:authDomain|projectId|databaseURL)["']?\s*[:=])""",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "firebase_config",
+        re.compile(
+            r"\b([a-z0-9][a-z0-9\-]{0,62}\.(?:firebaseio\.com|firebaseapp\.com))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "bearer_header",
+        re.compile(
+            r"""authorization["']?\s*[:=,]\s*["']?\s*Bearer\s+([A-Za-z0-9._\-+/=]{8,512})""",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "basic_auth_header",
+        re.compile(
+            r"""authorization["']?\s*[:=,]\s*["']?\s*Basic\s+([A-Za-z0-9+/=]{12,512})""",
+            re.IGNORECASE,
+        ),
+    ),
+    ("azure_storage_key", re.compile(r"AccountKey\s*=\s*([A-Za-z0-9+/=]{40,120})", re.IGNORECASE)),
+    (
+        # A bare UUID is a request id, a build id or a React key far more often
+        # than it is a credential, so the key-ish name is a hard requirement.
+        "heroku_api_key",
+        re.compile(
+            r"""(?:heroku|api|auth|access|client|app|service|session)[_-]?"""
+            r"""(?:api[_-]?)?(?:key|token|secret|password)["']?\s*[:=]\s*["']"""
+            r"""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']""",
+            re.IGNORECASE,
+        ),
+    ),
     ("private_key_block", re.compile(r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----)")),
     ("jwt", re.compile(r"\b(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})\b")),
     (
@@ -318,10 +381,17 @@ def looks_like_placeholder(value: str) -> bool:
 
 
 def extract_secrets(body: str, source: str = "", *, redact: bool = True) -> list[SensitiveMatch]:
-    """Credential-shaped strings, masked by default."""
+    """Credential-shaped strings, masked by default.
+
+    Context windows are redacted against *every* value found, not just the one
+    the window belongs to. Two secrets within a context width of each other are
+    common in a config object, and a window that quoted its neighbour verbatim
+    would put an unmasked credential in the report.
+    """
     matches: list[SensitiveMatch] = []
     seen: set[tuple[str, str]] = set()
     per_kind: dict[str, int] = {}
+    found_values: list[str] = []
 
     def add(kind: str, value: str, start: int, name: str | None = None) -> None:
         if looks_like_placeholder(value):
@@ -333,6 +403,7 @@ def extract_secrets(body: str, source: str = "", *, redact: bool = True) -> list
             return
         seen.add(identity)
         per_kind[kind] = per_kind.get(kind, 0) + 1
+        found_values.append(value)
         matches.append(
             SensitiveMatch(
                 kind=kind,
@@ -341,7 +412,8 @@ def extract_secrets(body: str, source: str = "", *, redact: bool = True) -> list
                 line=body.count("\n", 0, start) + 1,
                 source=source,
                 name=name,
-                context=_context(body, start, redact=redact, secret=value),
+                # Filled in below, once every value in this body is known.
+                context=_context(body, start, redact=False),
             )
         )
 
@@ -359,19 +431,91 @@ def extract_secrets(body: str, source: str = "", *, redact: bool = True) -> list
     for match in ASSIGNED_SECRET.finditer(body):
         add("assigned_secret", match.group(2), match.start(2), name=match.group(1))
 
+    if redact and found_values:
+        matches = [
+            replace(entry, context=_redact_all(entry.context, found_values))
+            for entry in matches
+        ]
     return matches
+
+
+#: A fragment this long is enough of a secret to matter.
+PARTIAL_SECRET_CHARS = 8
+
+
+def _redact_all(text: str | None, values: list[str]) -> str | None:
+    """Blank out every known secret value in a context window.
+
+    Whole values are replaced outright. The window is also a fixed-width slice
+    of the body, so it can begin or end part way through a neighbouring secret;
+    those partial fragments are trimmed too. Eight characters of a key is
+    enough to be worth protecting, and a truncated context is a small price.
+    """
+    if not text:
+        return text
+    for value in values:
+        if value and value in text:
+            text = text.replace(value, "[redacted]")
+
+    for value in values:
+        if not value or len(value) < PARTIAL_SECRET_CHARS:
+            continue
+        # A trailing fragment: the window ends inside this value.
+        for length in range(min(len(text), len(value) - 1), PARTIAL_SECRET_CHARS - 1, -1):
+            if text.endswith(value[:length]):
+                text = text[:-length] + "[redacted]"
+                break
+        # A leading fragment: the window begins inside this value.
+        for length in range(min(len(text), len(value) - 1), PARTIAL_SECRET_CHARS - 1, -1):
+            if text.startswith(value[-length:]):
+                text = "[redacted]" + text[length:]
+                break
+    return text
 
 
 # -- PII -----------------------------------------------------------------
 
 EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24})\b")
-#: Loose international phone shape; validated further below.
-PHONE_RE = re.compile(r"(?<![\w.])(\+?\d[\d\s().\-]{7,18}\d)(?![\w.])")
+#: Loose international phone shape; validated further below. The window starts
+#: at six so an eight-digit E.164 number is still offered to the validator.
+PHONE_RE = re.compile(r"(?<![\w.])(\+?\d[\d\s().\-]{6,18}\d)(?![\w.])")
 CARD_RE = re.compile(r"(?<!\d)((?:\d[ \-]?){12,18}\d)(?!\d)")
 IBAN_RE = re.compile(r"\b([A-Z]{2}\d{2}[A-Z0-9]{10,30})\b")
 SSN_RE = re.compile(r"\b(\d{3}-\d{2}-\d{4})\b")
 #: Vietnamese national ID / citizen number, 9 or 12 digits.
 VN_ID_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
+
+#: S3 bucket references. Group 1 is always the bucket name. Each form requires
+#: an ``s3`` label, so ``ec2.eu-west-1.amazonaws.com`` and friends stay out.
+S3_BUCKET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # <bucket>.s3.amazonaws.com and <bucket>.s3.<region>.amazonaws.com
+    re.compile(
+        r"\b([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])\.s3(?:[.\-][a-z0-9\-]{1,20})?\.amazonaws\.com\b",
+        re.IGNORECASE,
+    ),
+    # s3.<region>.amazonaws.com/<bucket> (path style)
+    re.compile(
+        r"(?<![\w.\-])s3(?:[.\-][a-z0-9\-]{1,20})?\.amazonaws\.com/([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"s3://([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])", re.IGNORECASE),
+)
+
+#: Issuer prefixes, longest first. Used to raise confidence in a Luhn-valid
+#: number, never as a gate: a card from an issuer not listed here is still
+#: reported, just without an issuer name attached.
+CARD_ISSUER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("6011", "discover"),
+    ("34", "amex"),
+    ("37", "amex"),
+    ("35", "jcb"),
+    ("51", "mastercard"),
+    ("52", "mastercard"),
+    ("53", "mastercard"),
+    ("54", "mastercard"),
+    ("55", "mastercard"),
+    ("4", "visa"),
+)
 
 #: Domains that only ever appear in examples.
 EXAMPLE_EMAIL_DOMAINS = {
@@ -396,6 +540,14 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _card_issuer(digits: str) -> str | None:
+    """Name the issuer when the prefix is one we know, otherwise ``None``."""
+    for prefix, issuer in CARD_ISSUER_PREFIXES:
+        if digits.startswith(prefix):
+            return issuer
+    return None
+
+
 def _plausible_phone(raw: str) -> bool:
     text = raw.strip()
     # Dotted quads and version strings reach this pattern; they are not phones.
@@ -408,12 +560,14 @@ def _plausible_phone(raw: str) -> bool:
     else:
         return False
     digits = re.sub(r"\D", "", text)
+    # E.164 is the confident case: a leading + and 8 to 15 digits.
+    if text.startswith("+"):
+        return 8 <= len(digits) <= 15
+    # Without the +, version strings, timestamps and ids all make long digit
+    # runs, so keep the old heuristic: a longer run plus a conventional
+    # separator. Loosening this is what would regress the false-positive tests.
     if not 9 <= len(digits) <= 15:
         return False
-    # Version strings, timestamps and ids make long digit runs; require either
-    # a leading + or conventional separators to call it a phone number.
-    if raw.strip().startswith("+"):
-        return True
     return bool(re.search(r"[\s().\-]", raw))
 
 
@@ -435,7 +589,14 @@ def extract_pii(body: str, source: str = "", *, redact: bool = True) -> list[Sen
     def overlaps(start: int, end: int) -> bool:
         return any(start < c_end and end > c_start for c_start, c_end in claimed)
 
-    def add(kind: str, value: str, start: int, masked: str, end: int | None = None) -> None:
+    def add(
+        kind: str,
+        value: str,
+        start: int,
+        masked: str,
+        end: int | None = None,
+        name: str | None = None,
+    ) -> None:
         identity = (kind, value)
         if identity in seen:
             return
@@ -452,6 +613,7 @@ def extract_pii(body: str, source: str = "", *, redact: bool = True) -> list[Sen
                 value=masked if redact else value,
                 line=body.count("\n", 0, start) + 1,
                 source=source,
+                name=name,
             )
         )
 
@@ -464,11 +626,29 @@ def extract_pii(body: str, source: str = "", *, redact: bool = True) -> list[Sen
             continue
         add("email", address, match.start(1), mask_email(address))
 
+    # Buckets before the numeric patterns: a bucket name can contain a long
+    # digit run, and the claimed span keeps it from being read as a number.
+    for pattern in S3_BUCKET_PATTERNS:
+        for match in pattern.finditer(body):
+            bucket = match.group(1).lower()
+            # Not masked: a bucket name is not personal data, and masking it
+            # would leave the operator with a finding they cannot act on.
+            add("s3_bucket", bucket, match.start(1), bucket, match.end(1))
+
     for match in CARD_RE.finditer(body):
         raw = match.group(1)
         digits = re.sub(r"\D", "", raw)
+        if overlaps(match.start(1), match.end(1)):
+            continue
         if _luhn_valid(digits):
-            add("credit_card", digits, match.start(1), mask_digits(digits), match.end(1))
+            add(
+                "credit_card",
+                digits,
+                match.start(1),
+                mask_digits(digits),
+                match.end(1),
+                name=_card_issuer(digits),
+            )
 
     for match in IBAN_RE.finditer(body):
         add("iban", match.group(1), match.start(1), mask_value(match.group(1)), match.end(1))

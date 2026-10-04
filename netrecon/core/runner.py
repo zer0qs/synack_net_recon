@@ -179,6 +179,30 @@ class RunPaths:
         return self.root / "webrecon"
 
     @property
+    def api_structure(self) -> Path:
+        return self.root / "api_structure.json"
+
+    @property
+    def api_endpoints(self) -> Path:
+        return self.root / "api_endpoints.txt"
+
+    @property
+    def js_endpoints(self) -> Path:
+        return self.root / "js_endpoints.txt"
+
+    @property
+    def parameters_json(self) -> Path:
+        return self.root / "parameters.json"
+
+    @property
+    def parameters_txt(self) -> Path:
+        return self.root / "parameters.txt"
+
+    @property
+    def js_findings(self) -> Path:
+        return self.root / "js_findings.json"
+
+    @property
     def service_findings(self) -> Path:
         return self.root / "service_findings.json"
 

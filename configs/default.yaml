@@ -94,9 +94,14 @@ scripts:
 nuclei:
   templates:
     - network/
-  severity: info,low,medium,high,critical
+  # info findings are noise in a network sweep; drop them by default.
+  severity: low,medium,high,critical
+  # Hard maximum: 50. Rate limit comes from limits.nuclei_rate (hard max 300).
   concurrency: 10
   timeout_seconds: 10
+  # Tags fuzz, fuzzing, intrusive, dos and brute-force are ALWAYS excluded in
+  # code. Anything listed here is added to that set; it cannot shorten it.
+  exclude_tags: []
 
 webrecon:
   # Read-only web reconnaissance. This stage issues HTTP GET requests only:
@@ -136,6 +141,10 @@ webrecon:
   # Fetch .map files referenced by scripts. Source maps carry the original
   # unminified sources and are usually the richest single artifact.
   fetch_source_maps: true
+  # Follow further .js references found inside fetched scripts, so bundles that
+  # lazy-load chunks are covered. Same in-scope endpoint only, and still bounded
+  # by max_scripts_per_endpoint.
+  crawl_scripts: true
   # Try both http:// and https:// on each open web port instead of guessing a
   # scheme from the port number. The wrong scheme fails fast.
   probe_both_schemes: true

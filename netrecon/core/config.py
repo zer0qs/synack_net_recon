@@ -25,6 +25,18 @@ MASSCAN_RATE_WARN_THRESHOLD = 1_000
 #: Absolute ceiling on nuclei requests per second.
 NUCLEI_RATE_HARD_MAX = 300
 
+#: Absolute ceiling on concurrent nuclei templates.  Nuclei multiplies this by
+#: its own per-template request fan-out, so a large value turns a rate-limited
+#: scan into a burst the client's network did not agree to absorb.
+NUCLEI_CONCURRENCY_HARD_MAX = 50
+
+#: The only severity words nuclei may be filtered on.  Anything else is a typo
+#: or an attempt to smuggle extra flags through the ``-severity`` value.
+NUCLEI_SEVERITIES: frozenset[str] = frozenset(
+    {"info", "low", "medium", "high", "critical"}
+)
+
+
 #: Absolute ceiling on worker threads spawning subprocesses.
 CONCURRENCY_HARD_MAX = 64
 
@@ -245,10 +257,72 @@ class ScriptsCfg:
 
 @dataclass
 class NucleiCfg:
+    """Limits for the optional nuclei stage.
+
+    The dangerous-tag exclusion lives in :mod:`netrecon.stages.nuclei` and is
+    not configurable away; ``exclude_tags`` here is additive only.
+    """
+
     templates: list[str] = field(default_factory=lambda: ["network/"])
-    severity: str = "info,low,medium,high,critical"
+    #: ``info`` is dropped from the default: informational templates triple the
+    #: request volume without changing what gets reported.
+    severity: str = "low,medium,high,critical"
     concurrency: int = 10
     timeout_seconds: int = 10
+    #: Extra template tags to exclude, *on top of* the stage's mandatory list.
+    exclude_tags: list[str] = field(default_factory=list)
+    def validate(self) -> list[str]:
+        warnings: list[str] = []
+
+        self.severity = _validate_severity(self.severity)
+
+        if self.concurrency < 1:
+            raise ConfigError("nuclei.concurrency must be >= 1")
+        if self.concurrency > NUCLEI_CONCURRENCY_HARD_MAX:
+            warnings.append(
+                f"nuclei.concurrency {self.concurrency} exceeds the hard maximum "
+                f"{NUCLEI_CONCURRENCY_HARD_MAX} and has been clamped"
+            )
+            self.concurrency = NUCLEI_CONCURRENCY_HARD_MAX
+
+        if self.timeout_seconds < 1:
+            raise ConfigError("nuclei.timeout_seconds must be >= 1")
+
+        cleaned_tags: list[str] = []
+        for tag in self.exclude_tags:
+            lowered = str(tag).strip().lower()
+            if not lowered:
+                continue
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", lowered):
+                raise ConfigError(
+                    f"nuclei.exclude_tags entry {tag!r} is not a bare tag name"
+                )
+            if lowered not in cleaned_tags:
+                cleaned_tags.append(lowered)
+        self.exclude_tags = cleaned_tags
+
+
+        return warnings
+
+
+
+def _validate_severity(raw: Any) -> str:
+    """Normalise a comma-separated severity list, rejecting anything unknown."""
+    parts = [part.strip().lower() for part in str(raw).split(",")]
+    cleaned: list[str] = []
+    for part in parts:
+        if not part:
+            raise ConfigError(f"nuclei.severity has an empty element: {raw!r}")
+        if part not in NUCLEI_SEVERITIES:
+            raise ConfigError(
+                f"nuclei.severity {part!r} is not a severity; permitted values: "
+                + ", ".join(sorted(NUCLEI_SEVERITIES))
+            )
+        if part not in cleaned:
+            cleaned.append(part)
+    if not cleaned:
+        raise ConfigError("nuclei.severity must not be empty")
+    return ",".join(cleaned)
 
 
 @dataclass
@@ -283,6 +357,9 @@ class WebReconCfg:
     #: Fetch .map files referenced by scripts. Source maps often contain the
     #: original, unminified sources.
     fetch_source_maps: bool = True
+    #: Follow further .js references found inside fetched scripts. Bounded by
+    #: max_scripts_per_endpoint, same in-scope endpoint only.
+    crawl_scripts: bool = True
     #: Probe both http:// and https:// on each open web port rather than
     #: guessing one scheme from the port number.
     probe_both_schemes: bool = True
@@ -470,6 +547,7 @@ class Config:
             self.sweep,
             self.services,
             self.scripts,
+            self.nuclei,
             self.webrecon,
             self.servicerecon,
         ):

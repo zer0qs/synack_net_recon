@@ -10,8 +10,10 @@ Produces, from every earlier stage's checkpoint:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from netrecon.core.jsonio import read_json, write_json
@@ -88,26 +90,85 @@ class HostSummary:
         }
 
 
-def build(ctx: RunContext) -> dict[str, Any]:
-    """Aggregate every stage artifact into summary.json and report.md."""
-    log = ctx.logger(NAME)
+@dataclass
+class Artifacts:
+    """Everything the report is built from, as plain data.
 
-    live_hosts = ctx.live_hosts()
-    sweep = read_json(ctx.paths.open_ports, default={}) or {}
-    services = read_json(ctx.paths.services, default={}) or {}
-    nuclei_findings = _load_nuclei(ctx)
-    webrecon = _load_webrecon(ctx)
-    service_findings = read_json(ctx.paths.service_findings, default={}) or {}
+    Collecting this is I/O; turning it into a report is not. Keeping the two
+    apart means :func:`aggregate` is a pure function that a test can call with
+    a literal dict, which is the only way the aggregation logic gets covered
+    properly - it is where the cross-stage reasoning lives.
+    """
 
+    live_hosts: list[str] = field(default_factory=list)
+    sweep: dict[str, Any] = field(default_factory=dict)
+    services: dict[str, Any] = field(default_factory=dict)
+    nuclei_findings: list[dict[str, Any]] = field(default_factory=list)
+    webrecon: dict[str, Any] = field(default_factory=dict)
+    service_findings: dict[str, Any] = field(default_factory=dict)
+    #: Addresses the run was authorised to touch. Used to re-filter artifacts
+    #: on read, so a hand-edited checkpoint cannot introduce a host.
+    in_scope: frozenset[str] = frozenset()
+    #: Run metadata, already reduced to plain values by :func:`collect`.
+    run: dict[str, Any] = field(default_factory=dict)
+    scope: dict[str, Any] = field(default_factory=dict)
+    limits: dict[str, Any] = field(default_factory=dict)
+    stages: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Aggregate:
+    """The result of aggregation: the payload plus the objects renderers need."""
+
+    payload: dict[str, Any]
+    hosts: list[HostSummary]
+    categories: list[categories_mod.Category]
+
+
+def collect(ctx: RunContext) -> Artifacts:
+    """Read every stage artifact off disk. This is the only I/O step."""
+    return Artifacts(
+        live_hosts=ctx.live_hosts(),
+        sweep=read_json(ctx.paths.open_ports, default={}) or {},
+        services=read_json(ctx.paths.services, default={}) or {},
+        nuclei_findings=_load_jsonl(ctx.paths.nuclei),
+        webrecon=_load_webrecon(ctx),
+        service_findings=read_json(ctx.paths.service_findings, default={}) or {},
+        in_scope=frozenset(str(address) for address in ctx.scope.addresses),
+        run={
+            "name": ctx.state.run_name,
+            "directory": str(ctx.paths.root),
+            "started_at": ctx.state.started_at,
+            "netrecon_version": ctx.state.netrecon_version,
+            "active_stage_enabled": ctx.active,
+            "web_stage_enabled": ctx.web,
+            "raw_sockets": ctx.privileges.raw_sockets,
+        },
+        scope=ctx.scope.summary(),
+        limits={
+            "sweep_rate_pps": ctx.config.limits.masscan_rate,
+            "nuclei_rate_rps": ctx.config.limits.nuclei_rate,
+            "concurrency": ctx.config.limits.concurrency,
+            "nmap_timing": ctx.config.limits.nmap_timing,
+            "webrecon_rate_rps": ctx.config.webrecon.rate_per_second if ctx.web else None,
+        },
+        stages={name: stage.to_dict() for name, stage in ctx.state.stages.items()},
+    )
+
+
+def aggregate(artifacts: Artifacts) -> Aggregate:
+    """Turn collected artifacts into the report payload.
+
+    Pure: no file access, no clock beyond the generated-at stamp, no network.
+    Every cross-stage decision the report makes happens here.
+    """
     summaries: dict[str, HostSummary] = {}
+    live_hosts = artifacts.live_hosts
 
     # Ports from the sweep are the skeleton; service data enriches them.
-    for ip, entries in sorted((sweep.get("hosts") or {}).items()):
-        if ip not in live_hosts and live_hosts:
-            # Keep going but note the inconsistency: never silently expand.
-            log.debug("sweep reported %s which is not in live_hosts.txt", ip)
+    for ip, entries in sorted((artifacts.sweep.get("hosts") or {}).items()):
         summary = summaries.setdefault(ip, HostSummary(ip))
-        for entry in entries:
+        for entry in entries or []:
             if not isinstance(entry, dict):
                 continue
             summary.open_ports.append(
@@ -121,7 +182,9 @@ def build(ctx: RunContext) -> dict[str, Any]:
                 }
             )
 
-    for host in services.get("hosts") or []:
+    for host in artifacts.services.get("hosts") or []:
+        if not isinstance(host, dict):
+            continue
         ip = host.get("address")
         if not ip:
             continue
@@ -133,11 +196,9 @@ def build(ctx: RunContext) -> dict[str, Any]:
             best = os_matches[0]
             summary.os_guess = f"{best.get('name')} ({best.get('accuracy')}%)"
 
-        indexed = {
-            (p.get("protocol", "tcp"), p.get("port")): p for p in summary.open_ports
-        }
+        indexed = {(p.get("protocol", "tcp"), p.get("port")): p for p in summary.open_ports}
         for port in host.get("ports") or []:
-            if port.get("state") != "open":
+            if not isinstance(port, dict) or port.get("state") != "open":
                 continue
             key = (port.get("protocol", "tcp"), port.get("port"))
             service = port.get("service") or {}
@@ -164,7 +225,9 @@ def build(ctx: RunContext) -> dict[str, Any]:
                 f"{len(host['host_scripts'])} host-level NSE script output(s) recorded"
             )
 
-    for finding in nuclei_findings:
+    for finding in artifacts.nuclei_findings:
+        if not isinstance(finding, dict):
+            continue
         ip = _finding_ip(finding)
         if ip is None:
             continue
@@ -179,20 +242,22 @@ def build(ctx: RunContext) -> dict[str, Any]:
             }
         )
 
-    # Web recon results attach to the host they were collected from. The scope
-    # filter runs again here: a hand-edited webrecon.json cannot add a host.
-    for result in webrecon.get("results") or []:
-        ip = result.get("ip")
-        if not ip or ip not in ctx.scope:
+    # Web recon and analyzer findings are re-filtered through the scope here:
+    # a hand-edited checkpoint must not be able to introduce a host.
+    for result in artifacts.webrecon.get("results") or []:
+        if not isinstance(result, dict):
             continue
-        summary = summaries.setdefault(ip, HostSummary(ip))
-        summary.web_endpoints.append(_web_endpoint_digest(result))
+        ip = result.get("ip")
+        if not ip or (artifacts.in_scope and ip not in artifacts.in_scope):
+            continue
+        summaries.setdefault(ip, HostSummary(ip)).web_endpoints.append(
+            _web_endpoint_digest(result)
+        )
 
-    # Per-service analyzer findings, re-filtered through the scope on read.
     from netrecon.stages.servicerecon import findings_by_host
 
-    for ip, findings in findings_by_host(service_findings).items():
-        if ip not in ctx.scope:
+    for ip, findings in findings_by_host(artifacts.service_findings).items():
+        if artifacts.in_scope and ip not in artifacts.in_scope:
             continue
         summaries.setdefault(ip, HostSummary(ip)).service_findings = findings
 
@@ -208,22 +273,27 @@ def build(ctx: RunContext) -> dict[str, Any]:
 
     ordered = [summaries[ip] for ip in sorted(summaries, key=_ip_sort_key)]
     categories = categories_mod.group_by_category(ordered)
-    payload = _summary_payload(
-        ctx,
-        ordered,
-        live_hosts,
-        sweep,
-        services,
-        nuclei_findings,
-        webrecon,
-        categories,
-        service_findings,
-    )
+    payload = _summary_payload(artifacts, ordered, categories)
+    return Aggregate(payload, ordered, categories)
+
+
+def build(ctx: RunContext) -> dict[str, Any]:
+    """Collect, aggregate and render. The I/O shell around :func:`aggregate`."""
+    log = ctx.logger(NAME)
+
+    result = aggregate(collect(ctx))
+    payload, ordered, categories = result.payload, result.hosts, result.categories
 
     write_json(ctx.paths.summary, payload)
     ctx.paths.report.write_text(render_markdown(payload, ordered, categories), encoding="utf-8")
     ctx.paths.report_html.write_text(
-        render_html(payload, ordered, categories, webrecon, service_findings),
+        render_html(
+            payload,
+            ordered,
+            categories,
+            read_json(ctx.paths.webrecon, default={}) or {},
+            read_json(ctx.paths.service_findings, default={}) or {},
+        ),
         encoding="utf-8",
     )
 
@@ -239,47 +309,29 @@ def build(ctx: RunContext) -> dict[str, Any]:
 
 
 def _summary_payload(
-    ctx: RunContext,
+    artifacts: Artifacts,
     hosts: list[HostSummary],
-    live_hosts: list[str],
-    sweep: dict[str, Any],
-    services: dict[str, Any],
-    nuclei_findings: list[dict[str, Any]],
-    webrecon: dict[str, Any],
     categories: list[categories_mod.Category],
-    service_findings: dict[str, Any],
 ) -> dict[str, Any]:
     open_ports = sum(len(h.open_ports) for h in hosts)
     notable = sum(len(h.notes) for h in hosts)
+    webrecon = artifacts.webrecon
+    service_findings = artifacts.service_findings
     web_results = webrecon.get("results") or []
     return {
         "generated_at": utc_now(),
-        "run": {
-            "name": ctx.state.run_name,
-            "directory": str(ctx.paths.root),
-            "started_at": ctx.state.started_at,
-            "netrecon_version": ctx.state.netrecon_version,
-            "active_stage_enabled": ctx.active,
-            "web_stage_enabled": ctx.web,
-            "raw_sockets": ctx.privileges.raw_sockets,
-        },
-        "scope": ctx.scope.summary(),
-        "limits": {
-            "sweep_rate_pps": ctx.config.limits.masscan_rate,
-            "nuclei_rate_rps": ctx.config.limits.nuclei_rate,
-            "concurrency": ctx.config.limits.concurrency,
-            "nmap_timing": ctx.config.limits.nmap_timing,
-            "webrecon_rate_rps": ctx.config.webrecon.rate_per_second if ctx.web else None,
-        },
-        "stages": {name: stage.to_dict() for name, stage in ctx.state.stages.items()},
+        "run": dict(artifacts.run),
+        "scope": dict(artifacts.scope),
+        "limits": dict(artifacts.limits),
+        "stages": dict(artifacts.stages),
         "totals": {
-            "in_scope_hosts": len(ctx.scope),
-            "live_hosts": len(live_hosts),
+            "in_scope_hosts": artifacts.scope.get("total_hosts", len(artifacts.in_scope)),
+            "live_hosts": len(artifacts.live_hosts),
             "hosts_reported": len(hosts),
             "hosts_with_open_ports": sum(1 for h in hosts if h.open_ports),
             "open_ports": open_ports,
-            "services_identified": services.get("services_identified", 0),
-            "nuclei_findings": len(nuclei_findings),
+            "services_identified": artifacts.services.get("services_identified", 0),
+            "nuclei_findings": len(artifacts.nuclei_findings),
             "notable_observations": notable,
             "service_categories": len(categories),
             "web_endpoints": len([r for r in web_results if not r.get("error")]),
@@ -291,6 +343,8 @@ def _summary_payload(
             "technologies": len(webrecon.get("technologies") or []),
             "cve_matches": webrecon.get("cve_matches", 0),
             "hosts_referenced": len(webrecon.get("hosts_referenced") or []),
+            "api_endpoints": webrecon.get("api_endpoints", 0),
+            "api_parameters": webrecon.get("api_parameters", 0),
             "service_findings": service_findings.get("findings", 0),
         },
         "service_findings": {
@@ -303,8 +357,10 @@ def _summary_payload(
             "technologies": webrecon.get("technologies") or [],
             "hosts_referenced": webrecon.get("hosts_referenced") or [],
             "high_value_paths": webrecon.get("high_value_paths") or [],
+            "api_structure": webrecon.get("api_structure") or {},
+            "parameters": webrecon.get("parameters") or [],
         },
-        "sweep_backend": sweep.get("backend"),
+        "sweep_backend": artifacts.sweep.get("backend"),
         "categories": [c.to_dict() for c in categories],
         "hosts": [h.to_dict() for h in hosts],
     }
@@ -411,6 +467,46 @@ def render_markdown(
             "confirm the exact build and patch level on each host before reporting.",
             "",
         ]
+
+    api = (web_block.get("api_structure") or {}).get("endpoints") or []
+    if api:
+        lines += [
+            "",
+            "## API surface reconstructed from front-end code",
+            "",
+            "Signatures recovered from JavaScript call sites. Parameters are what the",
+            "front-end sends, not a schema the server published - treat them as leads.",
+            "",
+            "| Signature | Body parameters | Source |",
+            "| --- | --- | --- |",
+        ]
+        for endpoint in api[:60]:
+            body_params = ", ".join(endpoint.get("body_params") or []) or "-"
+            lines.append(
+                f"| `{endpoint.get('signature')}` | {_escape(body_params)} | "
+                f"{endpoint.get('source_label')} |"
+            )
+        lines.append("")
+
+    parameters = web_block.get("parameters") or []
+    if parameters:
+        lines += [
+            "",
+            "## Parameter index",
+            "",
+            f"{len(parameters)} distinct parameter name(s), widest acceptance first.",
+            "A plain wordlist is at `parameters.txt`.",
+            "",
+            "| Parameter | Kinds | Endpoints | Occurrences |",
+            "| --- | --- | --- | --- |",
+        ]
+        for parameter in parameters[:60]:
+            kinds = ", ".join(parameter.get("kinds") or [])
+            lines.append(
+                f"| `{parameter.get('name')}` | {kinds} | "
+                f"{parameter.get('endpoint_count')} | {parameter.get('occurrences')} |"
+            )
+        lines.append("")
 
     if web_block.get("high_value_paths"):
         lines += ["", "## Sensitive paths accessible", ""]
@@ -731,13 +827,12 @@ def _finding_notes(host: HostSummary) -> list[str]:
     return notes
 
 
-def _load_nuclei(ctx: RunContext) -> list[dict[str, Any]]:
-    import json
-
-    path = ctx.paths.nuclei
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL artifact, tolerating a truncated final line."""
+    path = Path(path)
     if not path.is_file():
         return []
-    findings: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -747,8 +842,8 @@ def _load_nuclei(ctx: RunContext) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(record, dict):
-            findings.append(record)
-    return findings
+            records.append(record)
+    return records
 
 
 def _finding_ip(finding: dict[str, Any]) -> str | None:

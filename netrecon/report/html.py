@@ -341,6 +341,32 @@ def _render_overview(payload: dict[str, Any]) -> str:
             f"<td>{esc(stage.get('backend'))}</td><td>{esc(stage.get('detail'))}</td></tr>"
         )
     out.append("</tbody></table></section>")
+    out.append(_render_parameter_index(payload))
+    return "".join(out)
+
+
+def _render_parameter_index(payload: dict[str, Any]) -> str:
+    """Every parameter the front-end sends, widest acceptance first."""
+    parameters = (payload.get("web") or {}).get("parameters") or []
+    if not parameters:
+        return ""
+    out = [
+        f"<h2 class='section'>Parameter index ({len(parameters)})</h2>",
+        "<section class='card'><div class='sub'>Names the front-end sends, ordered by "
+        "how many endpoints accept each one. A plain wordlist is written to "
+        "<code>parameters.txt</code>.</div>",
+        "<table><thead><tr><th>Parameter</th><th>Kinds</th>"
+        "<th class='num'>Endpoints</th><th class='num'>Occurrences</th>"
+        "</tr></thead><tbody>",
+    ]
+    for parameter in parameters[:200]:
+        out.append(
+            f"<tr><td class='mono'>{esc(parameter.get('name'))}</td>"
+            f"<td>{esc(', '.join(parameter.get('kinds') or []))}</td>"
+            f"<td class='num'>{esc(parameter.get('endpoint_count'))}</td>"
+            f"<td class='num'>{esc(parameter.get('occurrences'))}</td></tr>"
+        )
+    out.append("</tbody></table></section>")
     return "".join(out)
 
 
@@ -796,6 +822,26 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                     f"<tr><td><span class='sev sev-medium'>{esc(match.get('kind'))}</span></td>"
                     f"<td class='mono'>{esc(match.get('value'))}</td>"
                     f"<td class='mono'>{esc(_short(match.get('source')))}</td></tr>"
+                )
+            out.append("</tbody></table>")
+
+        api_endpoints = result.get("api_endpoints") or []
+        if api_endpoints:
+            out.append(f"<h4>API surface reconstructed ({len(api_endpoints)})</h4>")
+            out.append(
+                "<div class='sub'>Signatures recovered from JavaScript call sites. "
+                "Parameters are what the front-end sends, not a published schema.</div>"
+            )
+            out.append(
+                "<table><thead><tr><th>Signature</th><th>Body parameters</th>"
+                "<th>Path</th><th>Source</th></tr></thead><tbody>"
+            )
+            for endpoint in api_endpoints[:200]:
+                out.append(
+                    f"<tr><td class='mono'>{esc(endpoint.get('signature'))}</td>"
+                    f"<td>{esc(', '.join(endpoint.get('body_params') or []) or '-')}</td>"
+                    f"<td>{esc(', '.join(endpoint.get('path_params') or []) or '-')}</td>"
+                    f"<td class='mono'>{esc(endpoint.get('source_label'))}</td></tr>"
                 )
             out.append("</tbody></table>")
 
