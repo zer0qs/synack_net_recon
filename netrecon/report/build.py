@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from netrecon.core.jsonio import read_json, write_json
+from netrecon.core.jsonio import read_json, write_json, write_text
 from netrecon.core.runner import RunContext
 from netrecon.core.state import utc_now
 from netrecon.report import categories as categories_mod
@@ -304,17 +304,14 @@ def build(ctx: RunContext) -> dict[str, Any]:
     payload, ordered, categories = result.payload, result.hosts, result.categories
 
     write_json(ctx.paths.summary, payload)
-    ctx.paths.report.write_text(render_markdown(payload, ordered, categories), encoding="utf-8")
-    ctx.paths.report_html.write_text(
-        render_html(
+    write_text(ctx.paths.report, render_markdown(payload, ordered, categories))
+    write_text(ctx.paths.report_html, render_html(
             payload,
             ordered,
             categories,
             read_json(ctx.paths.webrecon, default={}) or {},
             read_json(ctx.paths.service_findings, default={}) or {},
-        ),
-        encoding="utf-8",
-    )
+        ))
 
     log.info(
         "report written: %d host(s), %d open port(s), %d category/ies, "

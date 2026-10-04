@@ -8,6 +8,57 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+#: Every artifact in a run directory holds client-confidential data: service
+#: versions, internal hostnames, and the secret and PII candidates found in
+#: front-end code. The JSON artifacts were already 0600, but only as an
+#: accident of :class:`tempfile.NamedTemporaryFile`, while the reports -- the
+#: files anyone actually opens -- were left at whatever the umask gave, i.e.
+#: world-readable on a stock Linux. The mode is now explicit and the same for
+#: all of them.
+ARTIFACT_MODE = 0o600
+
+#: A run directory should not be listable by other users either.
+RUN_DIR_MODE = 0o700
+
+
+def secure_mkdir(path: str | Path) -> Path:
+    """``mkdir -p`` where every component created gets :data:`RUN_DIR_MODE`.
+
+    ``Path.mkdir(parents=True, mode=...)`` applies the mode only to the final
+    component: parents are created with the default, so a nested artifact
+    directory left its intermediate levels world-readable.
+    """
+    path = Path(path)
+    missing = [p for p in (path, *path.parents) if not p.exists()]
+    path.mkdir(parents=True, exist_ok=True)
+    for component in missing:
+        try:
+            component.chmod(RUN_DIR_MODE)
+        except OSError:  # noqa: S110 - a filesystem without modes is not fatal
+            pass
+    return path
+
+
+def write_text(path: str | Path, text: str) -> Path:
+    """Write a text artifact atomically, with the artifact file mode."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}-", suffix=".tmp", delete=False
+    )
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(handle.name, ARTIFACT_MODE)
+        os.chmod(handle.name, ARTIFACT_MODE)
+        os.replace(handle.name, path)
+    except BaseException:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
+    return path
+
 
 def write_json(path: str | Path, data: Any, *, indent: int = 2) -> Path:
     path = Path(path)
@@ -21,6 +72,7 @@ def write_json(path: str | Path, data: Any, *, indent: int = 2) -> Path:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(handle.name, ARTIFACT_MODE)
         os.replace(handle.name, path)
     except BaseException:
         Path(handle.name).unlink(missing_ok=True)
@@ -57,6 +109,7 @@ def write_lines(path: str | Path, lines: list[str]) -> Path:
             handle.write("".join(f"{line}\n" for line in lines))
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(handle.name, ARTIFACT_MODE)
         os.replace(handle.name, path)
     except BaseException:
         Path(handle.name).unlink(missing_ok=True)

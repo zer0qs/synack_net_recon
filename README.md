@@ -644,6 +644,23 @@ results/<run_name>/<UTC-timestamp>/
 └── targets/              # the scope-enforced target files given to each tool
 ```
 
+### File modes
+
+Every directory netrecon creates is `0700`, and every file netrecon writes is
+`0600` — the reports included. The run directory holds service versions,
+internal hostnames, the client's authorised address list, fetched response
+bodies and the secret and PII candidates found in front-end code, so none of it
+is readable by other users on a shared box.
+
+Files written by nmap, fping and naabu themselves (`nmap/`, `raw/`, and the
+saved bodies under `webrecon/`) keep whatever mode those tools chose, because
+netrecon does not perform those writes. They are protected by their `0700`
+parent directory, which is the actual boundary. `tests/test_artifact_permissions.py`
+pins both halves of this.
+
+An operator's own chosen `--output-dir` is left alone; only the directories
+netrecon creates inside it are locked.
+
 `summary.json` is the primary machine-readable format:
 
 ```jsonc

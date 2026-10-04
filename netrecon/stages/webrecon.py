@@ -61,7 +61,7 @@ from urllib.parse import urljoin, urlsplit
 
 from netrecon.analyze import apistructure, jsdata, techstack
 from netrecon.analyze.jsdata import JsAnalysis
-from netrecon.core.jsonio import read_json, write_json, write_lines
+from netrecon.core.jsonio import read_json, secure_mkdir, write_json, write_lines
 from netrecon.core.runner import RunContext, run_parallel
 from netrecon.core.state import utc_now
 from netrecon.report.categories import is_tls, is_web_service
@@ -534,7 +534,7 @@ def run(ctx: RunContext) -> StageResult:
         user_agent=cfg.user_agent,
         verify_tls=cfg.verify_tls,
     )
-    ctx.paths.webrecon_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(ctx.paths.webrecon_dir)
 
     def worker(endpoint: Endpoint) -> EndpointResult:
         try:
@@ -698,7 +698,7 @@ def _probe_endpoint(
         return result
 
     out_dir = ctx.paths.webrecon_host_dir(endpoint.ip, endpoint.port) / endpoint.scheme
-    out_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(out_dir)
 
     try:
         root = client.get(endpoint.base_url + "/")
@@ -899,7 +899,7 @@ def _probe_paths(
         if classification == "accessible":
             record["preview"] = response.text[:1000]
             name = _safe_filename(candidate.path.strip("/"), "root")
-            (out_dir / "paths").mkdir(parents=True, exist_ok=True)
+            secure_mkdir(out_dir / "paths")
             (out_dir / "paths" / name).write_bytes(response.body)
         elif classification == "redirected":
             record["location"] = response.headers.get("location")
@@ -1007,7 +1007,7 @@ def _same_endpoint_scripts(srcs: list[str], endpoint: Endpoint) -> list[str]:
 
 def _save_script(out_dir: Path, url: str, body: bytes) -> None:
     name = _safe_filename(urlsplit(url).path.lstrip("/"), "script.js")
-    (out_dir / "js").mkdir(parents=True, exist_ok=True)
+    secure_mkdir(out_dir / "js")
     (out_dir / "js" / name).write_bytes(body)
 
 

@@ -26,6 +26,8 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from netrecon.core.jsonio import ARTIFACT_MODE
+
 log = logging.getLogger(__name__)
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -324,6 +326,12 @@ class Scope:
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"{addr}\n" for addr in addresses), encoding="utf-8")
+        # The scope is the client's authorised address list, and this same
+        # method writes the run's scope.txt snapshot.
+        try:
+            path.chmod(ARTIFACT_MODE)
+        except OSError:  # noqa: S110 - a filesystem without modes is not fatal
+            pass
         return path, len(addresses)
 
     # -- reporting -------------------------------------------------------

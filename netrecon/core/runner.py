@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from netrecon.core.config import Config
+from netrecon.core.jsonio import RUN_DIR_MODE
 from netrecon.core.privileges import Privileges
 from netrecon.core.scope import Scope
 from netrecon.core.state import RunState
@@ -272,8 +273,15 @@ class RunPaths:
         return self.root / "targets"
 
     def ensure(self) -> None:
+        # A run directory holds client-confidential findings, so it is not
+        # listable by other users. mkdir's mode is subject to the umask, so the
+        # chmod afterwards is what actually guarantees it.
         for directory in (self.root, self.nmap_dir, self.raw_dir, self.targets_dir):
             directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.chmod(RUN_DIR_MODE)
+            except OSError:  # noqa: S110 - a filesystem without modes is not fatal
+                pass
 
     def webrecon_host_dir(self, ip: str, port: int) -> Path:
         """Per-endpoint directory for fetched bodies and scripts."""

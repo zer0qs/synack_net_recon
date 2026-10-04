@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from netrecon.core.jsonio import ARTIFACT_MODE
+
 RESERVED = set(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__
 ) | {"message", "asctime", "taskName"}
@@ -94,6 +96,12 @@ def configure(
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        # The run log carries every finding the stages logged, so it gets the
+        # same mode as the artifacts rather than whatever the umask allows.
+        try:
+            log_path.chmod(ARTIFACT_MODE)
+        except OSError:  # noqa: S110 - a filesystem without modes is not fatal
+            pass
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(JsonlFormatter())
         root.addHandler(file_handler)
