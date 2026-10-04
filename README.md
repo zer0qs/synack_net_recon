@@ -59,7 +59,20 @@ netrecon check-tools      # verify
 | --- | --- |
 | `--no-go` | Skip `naabu` and `nuclei` |
 | `--no-python` | Skip `pip install -e .` |
+| `--no-templates` | Skip the nuclei template fetch (the one step that needs the network) |
 | `--caps` | `setcap cap_net_raw,cap_net_admin+eip` on nmap/masscan/fping so raw scans work without `sudo` |
+
+The script ends with `check-tools`, so the last thing it prints is what
+netrecon can actually see. Two details it handles that are easy to miss by
+hand:
+
+- **The go tools are symlinked into `/usr/local/bin`.** `go install` puts them
+  in `$GOBIN`, which is on neither a login shell's `PATH` nor sudo's
+  `secure_path`, so a raw-socket run as root would not find them.
+- **nuclei ships no templates.** Without them it exits with
+  `no templates provided for scan`, so `--active` cannot work. The script
+  fetches them and then *counts* them, because `nuclei -update-templates`
+  exits 0 even when the download was blocked.
 
 Manual install:
 
@@ -67,8 +80,19 @@ Manual install:
 sudo apt-get install -y nmap masscan fping libcap2-bin
 go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+sudo ln -sf ~/go/bin/naabu ~/go/bin/nuclei /usr/local/bin/
+nuclei -update-templates          # required for --active
 pip install -e .
 ```
+
+### masscan cannot scan loopback
+
+masscan builds its own packets and sends them through a network adapter, so it
+never reaches `127.0.0.0/8` or `::1` — and it exits successfully having found
+nothing. A scope holding a loopback address therefore picks naabu or nmap
+instead, and says so in the log. This matters when testing netrecon itself
+against a service on localhost: with masscan selected the sweep reports zero
+open ports and every later stage skips.
 
 Only `nmap` is strictly required — every other tool has a fallback (see
 [Pipeline](#pipeline)). Running without installing the package also works:

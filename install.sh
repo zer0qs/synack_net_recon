@@ -6,21 +6,28 @@
 #   naabu, nuclei          -> go install (optional, skipped if go is absent)
 #
 # Usage:
-#   ./install.sh                 # apt packages + Python package + optional go tools
+#   ./install.sh                 # everything: apt, Python package, go tools, templates
 #   ./install.sh --no-go         # skip naabu/nuclei
 #   ./install.sh --no-python     # skip pip install of netrecon itself
+#   ./install.sh --no-templates  # skip the nuclei template fetch (needs network)
 #   ./install.sh --caps          # also grant CAP_NET_RAW to nmap/masscan/fping
+#
+# The go tools are symlinked into /usr/local/bin. Without that they land in
+# $GOBIN, which is not on PATH for a login shell and not on sudo's secure_path,
+# so netrecon reports them MISSING immediately after installing them.
 #
 set -euo pipefail
 
 WITH_GO=1
 WITH_PYTHON=1
 WITH_CAPS=0
+WITH_TEMPLATES=1
 
 for arg in "$@"; do
   case "$arg" in
     --no-go) WITH_GO=0 ;;
     --no-python) WITH_PYTHON=0 ;;
+    --no-templates) WITH_TEMPLATES=0 ;;
     --caps) WITH_CAPS=1 ;;
     -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
@@ -67,10 +74,16 @@ if [[ "$WITH_GO" -eq 1 ]]; then
     log "installing nuclei -> $GOBIN"
     go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \
       || warn "nuclei install failed"
-    case ":$PATH:" in
-      *":$GOBIN:"*) ;;
-      *) warn "add $GOBIN to PATH so netrecon can find naabu/nuclei" ;;
-    esac
+    # $GOBIN is not on PATH for a login shell, and sudo resets PATH to
+    # secure_path, so a raw-socket run as root would not see these at all.
+    # A symlink into /usr/local/bin is on both.
+    for tool in naabu nuclei; do
+      if [[ -x "$GOBIN/$tool" ]]; then
+        $SUDO ln -sf "$GOBIN/$tool" "/usr/local/bin/$tool" \
+          && log "  linked $tool into /usr/local/bin" \
+          || warn "  could not link $tool; add $GOBIN to PATH instead"
+      fi
+    done
   else
     warn "go is not installed; skipping naabu and nuclei"
     warn "  apt-get install -y golang-go   # then re-run ./install.sh"
@@ -87,6 +100,37 @@ if [[ "$WITH_CAPS" -eq 1 ]]; then
         || warn "  setcap failed on $path (not supported on this filesystem?)"
     fi
   done
+fi
+
+if [[ "$WITH_TEMPLATES" -eq 1 ]] && command -v nuclei >/dev/null 2>&1; then
+  # nuclei ships no templates and exits with
+  #   "Could not run nuclei: no templates provided for scan"
+  # until they are fetched, so netrecon's --active stage is dead on a fresh
+  # install without this. This is the one step that reaches the network; it
+  # downloads nuclei's own template repository and nothing else.
+  log "fetching nuclei templates (downloads from github.com)"
+  nuclei -update-templates -silent >/dev/null 2>&1 || true
+  # nuclei exits 0 even when the fetch fails (a blocked api.pdtm.sh, a
+  # firewall, a rate limit), leaving an empty template directory, so the exit
+  # status cannot be trusted. Count the templates instead: without them
+  # nuclei dies with "no templates provided for scan" and --active is dead.
+  TEMPLATE_DIR="$(nuclei -silent -tv 2>/dev/null | tail -1 || true)"
+  [[ -d "${TEMPLATE_DIR:-}" ]] || TEMPLATE_DIR="$HOME/nuclei-templates"
+  TEMPLATE_COUNT=0
+  if [[ -d "$TEMPLATE_DIR" ]]; then
+    TEMPLATE_COUNT="$(find "$TEMPLATE_DIR" -name '*.yaml' 2>/dev/null | wc -l)"
+  fi
+  if [[ "$TEMPLATE_COUNT" -gt 0 ]]; then
+    log "  $TEMPLATE_COUNT template(s) in $TEMPLATE_DIR"
+  else
+    warn "  NO templates were fetched: 'netrecon scan --active' will fail"
+    warn "  nuclei reports success even when this fails, so check by hand:"
+    warn "    nuclei -update-templates   # needs github.com and api.pdtm.sh"
+    warn "  every other stage works without it; only --active needs templates"
+  fi
+else
+  [[ "$WITH_TEMPLATES" -eq 0 ]] \
+    && warn "skipping templates; --active needs 'nuclei -update-templates' first"
 fi
 
 log "verifying installation"

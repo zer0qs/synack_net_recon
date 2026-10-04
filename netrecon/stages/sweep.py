@@ -20,9 +20,22 @@ from netrecon.stages.base import StageFailed, StageResult, StageSkipped
 NAME = "sweep"
 
 
+def _loopback_count(ctx: RunContext) -> int:
+    return len(ctx.scope.notable_addresses().get("loopback", ()))
+
+
 def choose_backend(ctx: RunContext) -> str:
+    """Pick a sweep backend, accounting for what each one physically can do."""
     configured = ctx.config.sweep.backend
     raw = ctx.privileges.raw_sockets
+    log = ctx.logger(NAME)
+
+    # masscan builds its own packets and sends them through a network adapter,
+    # bypassing the kernel's loopback path, so it finds nothing on 127.0.0.0/8
+    # and ::1 and exits successfully while doing it. Reporting that as a clean
+    # sweep would be exactly the silent lie the other guards here exist to
+    # prevent, so a loopback scope picks a backend that can actually see it.
+    loopback = _loopback_count(ctx)
 
     if configured == "masscan":
         if not ctx.tools.has("masscan"):
@@ -31,6 +44,15 @@ def choose_backend(ctx: RunContext) -> str:
             raise StageFailed(
                 "sweep.backend=masscan needs raw sockets; re-run with sudo or "
                 "CAP_NET_RAW, or set sweep.backend=auto to fall back to a connect scan"
+            )
+        if loopback:
+            log.warning(
+                "sweep.backend=masscan was requested explicitly, but masscan cannot "
+                "scan the %d loopback address(es) in scope: it sends raw packets "
+                "through a network adapter and never reaches 127.0.0.0/8 or ::1. "
+                "Those hosts will report zero open ports. Set sweep.backend=nmap "
+                "(or naabu) to scan them with a connect scan.",
+                loopback,
             )
         return "masscan"
     if configured == "naabu":
@@ -43,7 +65,23 @@ def choose_backend(ctx: RunContext) -> str:
         return "nmap"
 
     # auto
-    if raw and ctx.tools.has("masscan"):
+    if raw and ctx.tools.has("masscan") and not loopback:
+        return "masscan"
+    if raw and ctx.tools.has("masscan") and loopback:
+        fallback = "naabu" if ctx.tools.has("naabu") else "nmap"
+        if ctx.tools.has(fallback):
+            log.warning(
+                "scope holds %d loopback address(es), which masscan cannot reach; "
+                "using %s instead so the sweep can actually see them",
+                loopback,
+                fallback,
+            )
+            return fallback
+        log.warning(
+            "scope holds %d loopback address(es) and only masscan is available; "
+            "masscan cannot reach loopback, so expect zero open ports there",
+            loopback,
+        )
         return "masscan"
     if ctx.tools.has("naabu"):
         return "naabu"

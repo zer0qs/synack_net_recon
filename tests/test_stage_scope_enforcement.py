@@ -14,7 +14,8 @@ import pytest
 
 from netrecon.core.config import Config
 from netrecon.core.jsonio import write_json
-from netrecon.core.scope import ScopeViolation
+from netrecon.core.scope import Scope, ScopeViolation
+from netrecon.core.tools import TOOL_SPECS, ToolRegistry, ToolStatus
 from netrecon.stages import discovery, nuclei, services, sweep
 from netrecon.stages.base import StageFailed, StageSkipped
 
@@ -318,3 +319,75 @@ def test_targets_file_raises_on_internal_scope_violation(make_context):
     ctx = make_context()
     with pytest.raises(ScopeViolation):
         ctx.targets_file("bad.txt", [IN_SCOPE, OUT_OF_SCOPE])
+
+
+# -- masscan cannot see loopback ---------------------------------------
+#
+# Found by running netrecon for real, not by a unit test. With masscan
+# installed and raw sockets available, the auto backend picked masscan against
+# 127.0.0.1 and reported "found 0 open port(s)" while nmap and naabu both saw
+# the listener. masscan builds its own packets and sends them through a
+# network adapter, so it never reaches 127.0.0.0/8 or ::1 -- and it exits
+# successfully while finding nothing, which is the silent clean-result lie the
+# rest of this stage's guards exist to prevent.
+
+LOOPBACK_SCOPE_LINES = ["127.0.0.1", "::1"]
+
+
+def _loopback_scope() -> Scope:
+    return Scope.from_lines(LOOPBACK_SCOPE_LINES, source="loopback")
+
+
+def _only_tools(*names: str) -> ToolRegistry:
+    """A registry where only ``names`` are installed."""
+    return ToolRegistry(
+        {
+            spec.name: (
+                ToolStatus(spec, f"/usr/bin/{spec.name}", "9.99")
+                if spec.name in names
+                else ToolStatus(spec, None, None, "not found on PATH")
+            )
+            for spec in TOOL_SPECS
+        }
+    )
+
+
+def test_auto_backend_avoids_masscan_for_a_loopback_scope(make_context):
+    """naabu can do a connect scan on loopback; masscan provably cannot."""
+    ctx = make_context(scope_override=_loopback_scope())
+    assert sweep.choose_backend(ctx) == "naabu"
+
+
+def test_auto_backend_falls_back_to_nmap_when_naabu_is_absent(make_context):
+    tools = _only_tools("fping", "masscan", "nmap")
+    ctx = make_context(scope_override=_loopback_scope(), tools=tools)
+    assert sweep.choose_backend(ctx) == "nmap"
+
+
+def test_a_routable_scope_still_prefers_masscan(make_context):
+    """The loopback guard must not cost masscan on the targets it is for."""
+    assert sweep.choose_backend(make_context()) == "masscan"
+
+
+def test_a_mixed_scope_avoids_masscan_because_some_hosts_are_unreachable(make_context):
+    """One loopback address is enough: masscan would silently miss it."""
+    mixed = Scope.from_lines(["10.10.10.5", "127.0.0.1"], source="mixed")
+    ctx = make_context(scope_override=mixed)
+    assert sweep.choose_backend(ctx) == "naabu"
+
+
+def test_explicit_masscan_on_loopback_is_honoured_but_warned(make_context, caplog):
+    """An explicit backend is the operator's call; they still get told."""
+    config = Config()
+    config.sweep.backend = "masscan"
+    ctx = make_context(config=config, scope_override=_loopback_scope())
+    with caplog.at_level("WARNING"):
+        assert sweep.choose_backend(ctx) == "masscan"
+    assert "cannot" in caplog.text and "loopback" in caplog.text
+
+
+def test_masscan_only_loopback_scope_warns_rather_than_pretending(make_context):
+    """With nothing else installed, say so instead of reporting a clean zero."""
+    tools = _only_tools("fping", "masscan")
+    ctx = make_context(scope_override=_loopback_scope(), tools=tools)
+    assert sweep.choose_backend(ctx) == "masscan"

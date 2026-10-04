@@ -8,9 +8,11 @@ only through the CLI.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from netrecon.core import tools
 from netrecon.core.config import (
     CONCURRENCY_HARD_MAX,
     MASSCAN_RATE_HARD_MAX,
@@ -234,3 +236,71 @@ def test_unprivileged_reports_clearly():
 def test_detect_returns_a_consistent_object():
     privs = detect()
     assert privs.raw_sockets == (privs.is_root or privs.cap_net_raw)
+
+
+# -- version probing over a banner -------------------------------------
+#
+# check-tools reported naabu's version as "__": naabu and nuclei print ASCII
+# art before the version, and the probe read only the first non-empty line,
+# so the top of the banner became the version string. An operator reading
+# that table cannot tell a mis-parse from a broken install.
+
+NAABU_BANNER = """
+                  __
+  ___  ___  ___ _/ /  __ __
+ / _ \\/ _ \\/ _ \\/ _ \\/ // /
+/_//_/\\_,_/\\_,_/_.__/\\_,_/ v2.6.1
+
+\t\tprojectdiscovery.io
+"""
+
+NMAP_OUTPUT = "Nmap version 7.94SVN ( https://nmap.org )"
+FPING_OUTPUT = "fping: Version 5.1"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (NAABU_BANNER, "2.6.1"),
+        (NMAP_OUTPUT, "7.94"),
+        (FPING_OUTPUT, "5.1"),
+        ("masscan 1.3.2", "1.3.2"),
+    ],
+)
+def test_the_version_is_read_from_anywhere_in_the_output(
+    monkeypatch, output: str, expected: str
+) -> None:
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout=output, stderr="", returncode=0),
+    )
+    version, error = tools._probe_version("/usr/bin/x", ("-version",))
+    assert error is None
+    assert version is not None
+    assert version.startswith(expected)
+
+
+def test_a_banner_with_no_version_falls_back_to_the_first_line(monkeypatch) -> None:
+    """With no version anywhere, surface what the tool said rather than guess."""
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            stdout="   __\n  / /\nno version here\n", stderr="", returncode=0
+        ),
+    )
+    version, error = tools._probe_version("/usr/bin/x", ("-version",))
+    assert error is None
+    assert version == "__"  # the documented fallback, not a fabricated number
+
+
+def test_no_output_at_all_is_an_error_not_a_version(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tools.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    version, error = tools._probe_version("/usr/bin/x", ("-version",))
+    assert version is None
+    assert error is not None

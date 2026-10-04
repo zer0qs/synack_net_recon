@@ -99,11 +99,18 @@ def _probe_version(path: str, args: tuple[str, ...]) -> tuple[str | None, str | 
         return None, str(exc)
 
     output = (completed.stdout or "") + (completed.stderr or "")
-    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
-    if not first_line:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
         return None, "tool produced no version output"
-    match = _VERSION_RE.search(first_line)
-    return (match.group(1) if match else first_line[:80]), None
+
+    # Scan every line, not just the first. naabu and nuclei print an ASCII-art
+    # banner before the version, so reading only the first non-empty line
+    # reported naabu's version as "__" in the check-tools table.
+    for line in lines:
+        match = _VERSION_RE.search(line)
+        if match:
+            return match.group(1), None
+    return lines[0][:80], None
 
 
 def check_tools(specs: tuple[ToolSpec, ...] = TOOL_SPECS) -> dict[str, ToolStatus]:
