@@ -18,6 +18,7 @@ import pytest
 from netrecon.analyze.jsdata import (
     MAX_MATCHES_PER_KIND,
     SECRET_PATTERNS,
+    _is_hostname,
     analyse_javascript,
     extract_comments,
     extract_endpoints,
@@ -713,3 +714,74 @@ def test_context_is_unredacted_when_redaction_is_off():
     body = f'api_key = "{FAKE_KEY}";'
     match = extract_secrets(body, redact=False)[0]
     assert FAKE_KEY in (match.context or "")
+
+
+# -- filenames are not hosts -------------------------------------------
+#
+# Found by running netrecon against a real server, not by a unit test: a
+# directory listing put `readme.md` and `scope.txt.example` in the page body,
+# and both were reported under "Hosts referenced by front-end code ... out of
+# scope and not contacted". A pentest report that asks the operator to
+# consider authorising a README is a credibility problem, so the file shape is
+# rejected before anything reaches that section.
+
+FILENAMES_THAT_ARE_NOT_HOSTS = [
+    "readme.md",            # md is Moldova
+    "scope.txt.example",    # example is a reserved TLD, txt settles it
+    "app.js.map",
+    "style.min.css",
+    "archive.tar.gz",
+    "setup.py",             # py is Paraguay
+    "main.rs",              # rs is Serbia
+    "data.json",
+    "logo.png",
+    "bundle.js",
+]
+
+HOSTS_THAT_MUST_SURVIVE = [
+    "acme.com",             # the trade must never cost .com
+    "acme.pl",              # ... or Poland
+    "api.internal",
+    "db.staging.acme.vn",
+    "intranet.corp",
+    "jenkins.local",
+    "metadata.google.internal",
+    "foo.example.com",
+    "a.b.c.co.uk",
+    "vpn.acme.md",          # a real Moldovan host still reads as one
+]
+
+
+@pytest.mark.parametrize("candidate", FILENAMES_THAT_ARE_NOT_HOSTS)
+def test_a_filename_is_never_reported_as_a_host(candidate: str) -> None:
+    assert _is_hostname(candidate) is False
+
+
+@pytest.mark.parametrize("candidate", HOSTS_THAT_MUST_SURVIVE)
+def test_a_real_hostname_survives_the_filename_check(candidate: str) -> None:
+    assert _is_hostname(candidate) is True
+
+
+def test_a_directory_listing_contributes_no_referenced_hosts() -> None:
+    """The exact body shape that produced the false positive."""
+    body = (
+        '<html><body><h1>Directory listing for /</h1><ul>'
+        '<li><a href="readme.md">readme.md</a></li>'
+        '<li><a href="scope.txt.example">scope.txt.example</a></li>'
+        '<li><a href="install.sh">install.sh</a></li>'
+        '<li><a href="pyproject.toml">pyproject.toml</a></li>'
+        '</ul></body></html>'
+    )
+    _, hosts = extract_infrastructure(body, "(page)")
+    assert hosts == []
+
+
+def test_a_real_internal_host_in_the_same_listing_is_still_found() -> None:
+    """The filename check must not silence the finding that matters."""
+    body = (
+        '<html><body><ul><li><a href="readme.md">readme.md</a></li></ul>'
+        '<script>var api = "https://jenkins.corp.internal/api";</script>'
+        '</body></html>'
+    )
+    _, hosts = extract_infrastructure(body, "(page)")
+    assert hosts == ["jenkins.corp.internal"]

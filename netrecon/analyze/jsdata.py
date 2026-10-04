@@ -729,10 +729,52 @@ KNOWN_SUFFIXES: frozenset[str] = frozenset(
 )
 
 
+#: File extensions that are also real country-code TLDs, where a two-label
+#: string is far more likely a filename than a host. A directory listing or a
+#: relative ``href`` puts ``readme.md`` in a page body, and ``md`` is Moldova,
+#: so the suffix check alone reports a README as a host the operator should
+#: consider adding to the scope file.
+#:
+#: Every entry here is a deliberate trade: a Moldovan, Paraguayan, Serbian or
+#: Palestinian two-label domain referenced by a bundle will be missed. That is
+#: accepted because the file shape is overwhelmingly more common, and because
+#: anything genuinely reachable still turns up in the sweep. ``com`` and ``pl``
+#: were tried here and removed: Windows ``.com`` executables and Perl scripts
+#: are nothing against losing every ``.com`` and every Polish host.
+FILENAME_SUFFIXES: frozenset[str] = frozenset("md py rs ps".split())
+
+#: Extensions that only ever appear mid-name in a filename, never inside a
+#: hostname: ``app.js.map``, ``scope.txt.example``, ``style.min.css``.
+INNER_FILENAME_LABELS: frozenset[str] = frozenset(
+    """
+    js mjs cjs ts jsx tsx css scss html htm json xml yaml yml txt csv md
+    png jpg jpeg gif svg ico webp woff woff2 ttf eot pdf zip gz tar
+    min map bundle chunk spec d
+    """.split()
+)
+
+
 def _is_hostname(host: str) -> bool:
-    """True when the final label is a plausible public or internal suffix."""
-    suffix = host.rsplit(".", 1)[-1]
-    return suffix in KNOWN_SUFFIXES
+    """True when the dotted string is a plausible hostname rather than a file.
+
+    The suffix must be a real public or internal suffix, and the string must
+    not look like a filename. Both checks are needed: a page body is analysed
+    for secrets pasted into markup, so it also carries every relative link on
+    the page, and a filename whose extension collides with a TLD would
+    otherwise be reported as a host that is "out of scope and not contacted".
+    """
+    labels = host.split(".")
+    suffix = labels[-1]
+    if suffix not in KNOWN_SUFFIXES:
+        return False
+    if suffix in FILENAME_SUFFIXES and len(labels) == 2:
+        # "readme.md", "run.sh", "setup.py": a bare stem plus a colliding
+        # extension. A real two-label host under these suffixes is possible
+        # but vanishingly rare next to how often this shape is a file.
+        return False
+    # "scope.txt.example", "app.js.map": an inner label that is only ever a
+    # file extension settles it however many labels follow.
+    return not any(label in INNER_FILENAME_LABELS for label in labels[:-1])
 IPV4_RE = re.compile(r"(?<![\w.])((?:\d{1,3}\.){3}\d{1,3})(?![\w.])")
 
 #: Hostname fragments that mark a non-production or internal environment.
