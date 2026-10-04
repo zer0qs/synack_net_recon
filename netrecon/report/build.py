@@ -530,17 +530,28 @@ def render_markdown(
                 f"{endpoint.get('secret_candidates', 0)} secret candidate(s), "
                 f"{endpoint.get('pii_candidates', 0)} personal-data candidate(s)"
             )
+            # Secrets belong under the JavaScript line above, not under the
+            # paths line that follows.
+            for secret in endpoint.get("secrets") or []:
+                name = secret.get("name")
+                label = f"**{secret.get('kind')}**"
+                if name:
+                    label += f" `{name}`"
+                lines.append(
+                    f"  - {label} = `{secret.get('value')}` "
+                    f"({_escape(secret.get('source'))}:{secret.get('line')})"
+                )
             if endpoint.get("paths_accessible"):
                 lines.append(
                     f"- Accessible paths: {endpoint['paths_accessible']} "
                     "(see report.html or webrecon.json for the list)"
                 )
-            for secret in endpoint.get("secrets") or []:
-                lines.append(
-                    f"  - **{secret.get('kind')}** `{secret.get('name')}` = "
-                    f"`{secret.get('value')}` ({_escape(secret.get('source'))}"
-                    f":{secret.get('line')})"
-                )
+                for path in endpoint.get("accessible_paths") or []:
+                    marker = "**" if path.get("high_value") else ""
+                    lines.append(
+                        f"  - {marker}`{path.get('path')}`{marker} "
+                        f"(HTTP {path.get('status')}) - {path.get('reason')}"
+                    )
             lines.append("")
 
         if host.service_findings:
