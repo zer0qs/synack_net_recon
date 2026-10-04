@@ -606,7 +606,7 @@ netrecon report        Rebuild report.md / summary.json from a run directory
 | `--web` | Enable read-only web recon + JavaScript analysis (GET only) |
 | `--skip-discovery` | Treat every in-scope address as live |
 | `--stages LIST` | Stage allowlist, e.g. `discovery,sweep` |
-| `--resume` / `--resume-dir DIR` | Resume the latest / a specific run |
+| `--resume` / `--resume-dir DIR` | Resume the latest / a specific run (`--targets` optional: the run's `scope.txt` snapshot is used) |
 | `--dry-run` | Plan the run, send no packets |
 | `-y, --yes` | Skip the authorisation prompt (required when stdin is not a TTY) |
 | `-v/-q` | Verbose / quiet console logging |

@@ -207,8 +207,12 @@ def report_command(
 
 @app.command("scan")
 def scan_command(
-    targets: Path = typer.Option(
-        ..., "--targets", "-t", help="File of in-scope IPs / CIDRs, one per line."
+    targets: Path | None = typer.Option(
+        None,
+        "--targets",
+        "-t",
+        help="File of in-scope IPs / CIDRs, one per line. "
+        "Optional when resuming: the run's own scope.txt snapshot is used.",
     ),
     config_path: Path | None = typer.Option(
         None, "--config", "-c", help="YAML config file (see configs/default.yaml)."
@@ -297,7 +301,6 @@ def scan_command(
             skip_discovery=skip_discovery,
             stages=stages,
         )
-        scope = _load_scope(targets, config)
     except (ConfigError, ScopeError, ScriptPolicyError) as exc:
         typer.secho(f"error: {exc}", fg="red", err=True)
         raise typer.Exit(EXIT_USAGE) from exc
@@ -315,6 +318,36 @@ def scan_command(
                 err=True,
             )
             raise typer.Exit(EXIT_USAGE)
+
+    # Resuming already fixed the scope: it is snapshotted in the run directory,
+    # and prepare_run_dir refuses a checkpoint whose scope fingerprint differs.
+    # Defaulting to that snapshot is therefore safer than making the operator
+    # retype --targets, which is one more chance to resume against the wrong
+    # scope file.
+    if targets is None:
+        if resume_from is None:
+            typer.secho(
+                "error: --targets is required unless you are resuming a run",
+                fg="red",
+                err=True,
+            )
+            raise typer.Exit(EXIT_USAGE)
+        snapshot = Path(resume_from) / "scope.txt"
+        if not snapshot.is_file():
+            typer.secho(
+                f"error: {resume_from} has no scope.txt snapshot; "
+                "pass --targets with the original scope file",
+                fg="red",
+                err=True,
+            )
+            raise typer.Exit(EXIT_USAGE)
+        targets = snapshot
+
+    try:
+        scope = _load_scope(targets, config)
+    except (ConfigError, ScopeError, ScriptPolicyError) as exc:
+        typer.secho(f"error: {exc}", fg="red", err=True)
+        raise typer.Exit(EXIT_USAGE) from exc
 
     try:
         run_dir, resuming = pipeline.prepare_run_dir(config, resume_from=resume_from)
