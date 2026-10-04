@@ -277,7 +277,8 @@ def _parse_host(element: ET.Element) -> Host | None:
     ]
     os_matches.sort(key=lambda m: m.accuracy, reverse=True)
 
-    host_scripts = _parse_scripts(element.find("hostscript") or ET.Element("hostscript"))
+    hostscript_el = element.find("hostscript")
+    host_scripts = _parse_scripts(hostscript_el) if hostscript_el is not None else {}
 
     return Host(
         address=address,
