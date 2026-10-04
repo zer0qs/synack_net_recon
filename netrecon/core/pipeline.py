@@ -22,7 +22,15 @@ from netrecon.core.scope import Scope
 from netrecon.core.state import RunState, timestamp_dirname
 from netrecon.core.tools import ToolRegistry
 from netrecon.report import build as report_build
-from netrecon.stages import discovery, nuclei, scripts, services, sweep, webrecon
+from netrecon.stages import (
+    discovery,
+    nuclei,
+    scripts,
+    servicerecon,
+    services,
+    sweep,
+    webrecon,
+)
 from netrecon.stages.base import StageFailed, StageResult, StageSkipped
 
 log = logging.getLogger("netrecon.pipeline")
@@ -35,6 +43,7 @@ STAGE_ORDER: tuple[tuple[str, str, Callable[[RunContext], StageResult]], ...] = 
     ("scripts", "scripts", scripts.run),
     ("nuclei", "nuclei", nuclei.run),
     ("webrecon", "webrecon", webrecon.run),
+    ("servicerecon", "servicerecon", servicerecon.run),
 )
 
 
@@ -151,6 +160,8 @@ def preflight_summary(ctx: RunContext) -> str:
         f" Stages enabled    : {', '.join(enabled) or 'none'}",
         f" Active stage      : {'ENABLED (nuclei)' if ctx.active else 'disabled'}",
         f" Web recon         : {'ENABLED (GET only)' if ctx.web else 'disabled'}",
+        f" Service analysis  : "
+        f"{'ENABLED (offline)' if cfg.stages.servicerecon else 'disabled'}",
         f" Privileges        : {ctx.privileges.describe()}",
         f" Tools available   : {', '.join(ctx.tools.available()) or 'none'}",
     ]
@@ -210,6 +221,15 @@ def preflight_summary(ctx: RunContext) -> str:
             f"   {web.max_scripts_per_endpoint} script(s) each, "
             f"{web.max_response_bytes // 1024} KiB per response.",
         ]
+        if web.hidden_paths:
+            lines += [
+                f"   --hidden-paths is ON: up to {web.max_hidden_paths} curated path(s)",
+                "   per endpoint will be requested. These are GETs of commonly exposed",
+                "   files, not a directory brute-force wordlist, but they WILL appear",
+                "   as 404s in the target's access log. Confirm this is agreed.",
+            ]
+        if web.cve_feed:
+            lines.append(f"   CVE feed (local file): {web.cve_feed}")
         if not web.verify_tls:
             lines.append(
                 "   TLS certificates are not verified (in-scope hosts often use"

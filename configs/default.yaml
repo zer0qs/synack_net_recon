@@ -35,6 +35,9 @@ stages:
   nuclei: false
   # Read-only web recon + JavaScript analysis. Requires --web.
   webrecon: false
+  # Per-service deep analysis of evidence already collected. Sends no
+  # packets; also reachable with --service-recon.
+  servicerecon: false
 
 scope:
   # Refuse to start if the scope file expands beyond this many addresses.
@@ -119,4 +122,39 @@ webrecon:
   # in the saved response body under webrecon/ for manual verification.
   # Turning this off writes candidate secrets into the report in full.
   redact_secrets: true
-  user_agent: netrecon/1.1 (authorised security assessment)
+  user_agent: netrecon/1.2 (authorised security assessment)
+
+  # Probe a short curated list of commonly exposed files (.git/HEAD, .env,
+  # backups, Actuator endpoints...). This IS path probing: it generates 404s in
+  # the target's access log. Off unless --hidden-paths is passed. Hard maximum
+  # on the list length: 400 - this must not become a brute-force wordlist.
+  hidden_paths: false
+  max_hidden_paths: 120
+  # Also request paths the site itself publishes in robots.txt and sitemap.xml.
+  # Not guessing: the site advertised them. On by default.
+  follow_published_paths: true
+  # Fetch .map files referenced by scripts. Source maps carry the original
+  # unminified sources and are usually the richest single artifact.
+  fetch_source_maps: true
+  # Try both http:// and https:// on each open web port instead of guessing a
+  # scheme from the port number. The wrong scheme fails fast.
+  probe_both_schemes: true
+  # Report personal data found in front-end assets. Counts and kinds are the
+  # finding; sample values are masked. Turning this off omits the section.
+  detect_pii: true
+  # Local NVD/CVE JSON feed used to correlate detected versions. Empty means no
+  # correlation. netrecon NEVER downloads a feed - point this at a file you
+  # fetched yourself. Matches are correlations, not verified vulnerabilities.
+  cve_feed: ""
+
+servicerecon:
+  # Per-service deep analysis. Pure offline analysis of the nmap -sV and NSE
+  # output the earlier stages already collected, so it is cheap and repeatable.
+  #
+  # Analyzers to run. Omit or leave empty for all of them:
+  #   tls smb database ssh snmp dns mail http
+  analyzers:
+  # The TLS analyzer may open one connection per endpoint when no ssl-cert NSE
+  # output exists. This is the only network access this stage can make.
+  allow_tls_probe: true
+  probe_timeout_seconds: 10

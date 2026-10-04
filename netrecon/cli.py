@@ -227,6 +227,30 @@ def scan_command(
     active: bool = typer.Option(
         False, "--active", help="Enable the nuclei stage (template-driven probes, rate-capped)."
     ),
+    hidden_paths: bool = typer.Option(
+        False,
+        "--hidden-paths",
+        help=(
+            "With --web, also GET a curated list of commonly exposed files "
+            "(.git/HEAD, .env, backups, Actuator...). Generates 404s in the target's logs."
+        ),
+    ),
+    cve_feed: Path | None = typer.Option(
+        None,
+        "--cve-feed",
+        help=(
+            "Local NVD/CVE JSON feed used to correlate detected versions. "
+            "netrecon never downloads a feed; point this at a file you fetched."
+        ),
+    ),
+    service_recon: bool = typer.Option(
+        False,
+        "--service-recon",
+        help=(
+            "Deep per-service analysis of evidence already collected "
+            "(TLS, SMB, SSH, databases, DNS, SNMP, mail, HTTP). Sends no packets."
+        ),
+    ),
     web: bool = typer.Option(
         False,
         "--web",
@@ -267,6 +291,9 @@ def scan_command(
             banners=banners,
             active=active,
             web=web,
+            hidden_paths=hidden_paths,
+            cve_feed=cve_feed,
+            service_recon=service_recon,
             skip_discovery=skip_discovery,
             stages=stages,
         )
@@ -343,6 +370,8 @@ def scan_command(
             "tools": ctx.tools.to_dict(),
             "active": active,
             "web": web,
+            "hidden_paths": hidden_paths,
+            "service_recon": config.stages.servicerecon,
             "dry_run": dry_run,
         },
     )
@@ -409,6 +438,9 @@ def _apply_overrides(
     banners: bool,
     active: bool,
     web: bool,
+    hidden_paths: bool,
+    cve_feed: Path | None,
+    service_recon: bool,
     skip_discovery: bool,
     stages: str | None,
 ) -> None:
@@ -433,6 +465,17 @@ def _apply_overrides(
     # same way: both send application-layer traffic, so neither turns itself on.
     config.stages.nuclei = bool(active)
     config.stages.webrecon = bool(web)
+    # Service analysis reads what is already on disk, so it is safe to leave on
+    # whenever the config asks for it; the flag only turns it on.
+    config.stages.servicerecon = bool(service_recon) or config.stages.servicerecon
+    if hidden_paths:
+        if not web:
+            raise ConfigError("--hidden-paths only applies with --web")
+        config.webrecon.hidden_paths = True
+    if cve_feed is not None:
+        if not Path(cve_feed).is_file():
+            raise ConfigError(f"--cve-feed: file not found: {cve_feed}")
+        config.webrecon.cve_feed = str(cve_feed)
     if skip_discovery:
         config.discovery.method = "skip"
 
@@ -445,6 +488,7 @@ def _apply_overrides(
             "scripts",
             "nuclei",
             "webrecon",
+            "servicerecon",
             "os_detect",
         }
         unknown = requested - known
@@ -458,6 +502,8 @@ def _apply_overrides(
             raise ConfigError("the nuclei stage also requires --active")
         if "webrecon" in requested and not web:
             raise ConfigError("the webrecon stage also requires --web")
+        if "servicerecon" in requested:
+            config.stages.servicerecon = True
 
     # Re-validate so clamping and warnings reflect the overrides.
     config.validate()

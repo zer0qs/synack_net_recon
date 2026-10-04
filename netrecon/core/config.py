@@ -39,6 +39,14 @@ WEBRECON_RATE_WARN_THRESHOLD = 10
 #: Absolute ceiling on bytes read from a single HTTP response (16 MiB).
 WEBRECON_RESPONSE_BYTES_HARD_MAX = 16_777_216
 
+#: Absolute ceiling on well-known paths probed per endpoint.  This is the knob
+#: that separates "check a short list of commonly exposed files" from "directory
+#: brute forcing", so it is capped hard and low on purpose.
+HIDDEN_PATHS_HARD_MAX = 400
+
+#: Rate above which hidden-path probing gets its own warning.
+HIDDEN_PATHS_RATE_WARN = 10
+
 
 class ConfigError(Exception):
     """The configuration is unusable."""
@@ -113,6 +121,7 @@ class Stages:
     scripts: bool = False
     nuclei: bool = False
     webrecon: bool = False
+    servicerecon: bool = False
 
     def enabled_names(self) -> list[str]:
         return [f.name for f in fields(self) if getattr(self, f.name)]
@@ -262,7 +271,27 @@ class WebReconCfg:
     #: Mask candidate secrets in the report. The full value stays in the saved
     #: response body under webrecon/ for manual verification.
     redact_secrets: bool = True
-    user_agent: str = "netrecon/1.1 (authorised security assessment)"
+    user_agent: str = "netrecon/1.2 (authorised security assessment)"
+    #: Probe a curated list of commonly exposed paths. This DOES generate 404s
+    #: in the target's logs; it is off unless the operator passes --hidden-paths.
+    hidden_paths: bool = False
+    #: Cap on well-known paths tried per endpoint. Hard maximum: 400.
+    max_hidden_paths: int = 120
+    #: Also follow paths the site itself publishes in robots.txt and
+    #: sitemap.xml. These are not brute forcing - the site advertised them.
+    follow_published_paths: bool = True
+    #: Fetch .map files referenced by scripts. Source maps often contain the
+    #: original, unminified sources.
+    fetch_source_maps: bool = True
+    #: Probe both http:// and https:// on each open web port rather than
+    #: guessing one scheme from the port number.
+    probe_both_schemes: bool = True
+    #: Report personal data found in front-end assets (counts plus masked
+    #: samples). Turning this off omits the PII section entirely.
+    detect_pii: bool = True
+    #: Local NVD/CVE feed used to correlate detected versions. Empty means no
+    #: correlation; netrecon never fetches a feed over the network.
+    cve_feed: str = ""
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
@@ -305,7 +334,47 @@ class WebReconCfg:
             )
         if not self.user_agent.strip():
             raise ConfigError("webrecon.user_agent must not be empty")
+
+        if self.max_hidden_paths < 1:
+            raise ConfigError("webrecon.max_hidden_paths must be >= 1")
+        if self.max_hidden_paths > HIDDEN_PATHS_HARD_MAX:
+            warnings.append(
+                f"webrecon.max_hidden_paths {self.max_hidden_paths} exceeds the hard "
+                f"maximum {HIDDEN_PATHS_HARD_MAX} and has been clamped"
+            )
+            self.max_hidden_paths = HIDDEN_PATHS_HARD_MAX
+        if self.hidden_paths and self.rate_per_second > HIDDEN_PATHS_RATE_WARN:
+            warnings.append(
+                f"webrecon.hidden_paths is on at {self.rate_per_second} rps - path "
+                "probing generates one request per path per endpoint and will be "
+                "visible in the target's access logs"
+            )
         return warnings
+
+
+@dataclass
+class ServiceReconCfg:
+    """Per-service deep analysis. Offline by default - it re-reads what the
+    earlier stages already collected and sends no packets of its own."""
+
+    #: Analyzer names to run; None means all of them.
+    analyzers: list[str] | None = None
+    #: Allow the TLS analyzer one connection per endpoint when no ssl-cert NSE
+    #: output exists. This is the only network access this stage can make.
+    allow_tls_probe: bool = True
+    probe_timeout_seconds: int = 10
+
+    def validate(self) -> list[str]:
+        from netrecon.analyze.registry import UnknownAnalyzer, validate_names
+
+        if self.analyzers is not None:
+            try:
+                self.analyzers = validate_names(list(self.analyzers))
+            except UnknownAnalyzer as exc:
+                raise ConfigError(str(exc)) from exc
+        if self.probe_timeout_seconds < 1:
+            raise ConfigError("servicerecon.probe_timeout_seconds must be >= 1")
+        return []
 
 
 @dataclass
@@ -333,6 +402,7 @@ class Config:
     scripts: ScriptsCfg = field(default_factory=ScriptsCfg)
     nuclei: NucleiCfg = field(default_factory=NucleiCfg)
     webrecon: WebReconCfg = field(default_factory=WebReconCfg)
+    servicerecon: ServiceReconCfg = field(default_factory=ServiceReconCfg)
 
     #: Warnings raised while validating, surfaced in the pre-flight summary.
     warnings: list[str] = field(default_factory=list)
@@ -369,6 +439,7 @@ class Config:
             "scripts": ScriptsCfg,
             "nuclei": NucleiCfg,
             "webrecon": WebReconCfg,
+            "servicerecon": ServiceReconCfg,
         }
         kwargs: dict[str, Any] = {}
         known_top = {f.name for f in fields(cls)}
@@ -400,6 +471,7 @@ class Config:
             self.services,
             self.scripts,
             self.webrecon,
+            self.servicerecon,
         ):
             validator = getattr(section, "validate", None)
             if validator is not None:

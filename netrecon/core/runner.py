@@ -179,6 +179,14 @@ class RunPaths:
         return self.root / "webrecon"
 
     @property
+    def service_findings(self) -> Path:
+        return self.root / "service_findings.json"
+
+    @property
+    def cve_matches(self) -> Path:
+        return self.root / "cve_matches.json"
+
+    @property
     def run_log(self) -> Path:
         return self.root / "run.log"
 

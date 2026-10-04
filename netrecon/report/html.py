@@ -184,6 +184,7 @@ def render_html(
     hosts: list[Any],
     categories: list[Category],
     webrecon: dict[str, Any] | None = None,
+    service_findings: dict[str, Any] | None = None,
 ) -> str:
     """Render the complete report as one self-contained HTML document."""
     run = payload["run"]
@@ -195,6 +196,10 @@ def render_html(
         ("tab-hosts", f"By host ({len(hosts)})"),
         ("tab-categories", f"By service ({len(categories)})"),
     ]
+    findings_results = (service_findings or {}).get("results") or []
+    finding_total = sum(len(r.get("findings") or []) for r in findings_results)
+    if finding_total:
+        tabs.insert(1, ("tab-findings", f"Findings ({finding_total})"))
     web_results = (webrecon or {}).get("results") or []
     if web_results:
         tabs.append(("tab-web", f"Web recon ({len(web_results)})"))
@@ -227,6 +232,12 @@ def render_html(
     parts.append("</nav>")
 
     parts.append(f"<div class='panel' id='tab-overview' hidden>{_render_overview(payload)}</div>")
+    if finding_total:
+        parts.append(
+            "<div class='panel' id='tab-findings' hidden>"
+            + _render_findings(service_findings or {})
+            + "</div>"
+        )
     parts.append(f"<div class='panel' id='tab-hosts' hidden>{_render_hosts(hosts)}</div>")
     parts.append(
         f"<div class='panel' id='tab-categories' hidden>{_render_categories(categories)}</div>"
@@ -260,6 +271,16 @@ def _render_stats(totals: dict[str, Any]) -> str:
         cells.append(("Web endpoints", totals["web_endpoints"]))
     if totals.get("js_secret_candidates"):
         cells.append(("JS secret candidates", totals["js_secret_candidates"]))
+    if totals.get("service_findings"):
+        cells.append(("Service findings", totals["service_findings"]))
+    if totals.get("js_pii_candidates"):
+        cells.append(("PII candidates", totals["js_pii_candidates"]))
+    if totals.get("paths_accessible"):
+        cells.append(("Paths accessible", totals["paths_accessible"]))
+    if totals.get("technologies"):
+        cells.append(("Technologies", totals["technologies"]))
+    if totals.get("cve_matches"):
+        cells.append(("CVE correlations", totals["cve_matches"]))
     if totals.get("nuclei_findings"):
         cells.append(("nuclei findings", totals["nuclei_findings"]))
 
@@ -320,6 +341,88 @@ def _render_overview(payload: dict[str, Any]) -> str:
             f"<td>{esc(stage.get('backend'))}</td><td>{esc(stage.get('detail'))}</td></tr>"
         )
     out.append("</tbody></table></section>")
+    return "".join(out)
+
+
+def _render_findings(payload: dict[str, Any]) -> str:
+    """The cross-host findings view: everything the analyzers concluded."""
+    results = payload.get("results") or []
+    flat: list[dict[str, Any]] = []
+    for result in results:
+        for finding in result.get("findings") or []:
+            flat.append({**finding, **{
+                "ip": result.get("ip"),
+                "port": result.get("port"),
+                "protocol": result.get("protocol"),
+                "analyzer": result.get("analyzer"),
+            }})
+    if not flat:
+        return "<p class='empty'>No service findings.</p>"
+
+    flat.sort(
+        key=lambda f: (
+            SEVERITY_ORDER.get(str(f.get("severity") or "info").lower(), 9),
+            str(f.get("ip") or ""),
+            f.get("port") or 0,
+        )
+    )
+    by_severity = payload.get("by_severity") or {}
+
+    out = [
+        "<h2 class='section'>Service findings</h2>",
+        "<div class='notice'>Derived offline from the <code>nmap -sV</code> and NSE "
+        "output already collected - this analysis sent no packets. Severity is an "
+        "<strong>exposure</strong> judgement, not an exploitability rating: it means "
+        "\"an assessor should look at this\", never \"this host is exploitable\".</div>",
+        "<div class='grid'>",
+    ]
+    for severity in ("critical", "high", "medium", "low", "info"):
+        if by_severity.get(severity):
+            out.append(
+                f"<div class='stat'><div class='n sev-{esc(severity)}'>"
+                f"{esc(by_severity[severity])}</div>"
+                f"<div class='k'>{esc(severity)}</div></div>"
+            )
+    out.append("</div>")
+
+    out.append(
+        "<input class='filter' type='search' data-scope='findings-list' "
+        "placeholder='Filter by host, title, analyzer&hellip;' "
+        "aria-label='Filter findings'>"
+    )
+    out.append("<div id='findings-list'><section class='card'>")
+    out.append(
+        "<table><thead><tr><th>Severity</th><th>Host</th><th class='num'>Port</th>"
+        "<th>Finding</th><th>Analyzer</th></tr></thead><tbody>"
+    )
+    for finding in flat:
+        severity = str(finding.get("severity") or "info").lower()
+        haystack = " ".join(
+            str(finding.get(k) or "")
+            for k in ("ip", "title", "analyzer", "summary", "key")
+        ).lower()
+        out.append(
+            f"<tr data-search=\"{esc(haystack)}\">"
+            f"<td><span class='sev sev-{esc(severity)}'>{esc(severity)}</span></td>"
+            f"<td><a href='#host-{esc(_slug(finding.get('ip')))}'>{esc(finding.get('ip'))}</a></td>"
+            f"<td class='num'>{esc(finding.get('port'))}</td>"
+            f"<td><strong>{esc(finding.get('title'))}</strong><br>"
+            f"<span class='muted'>{esc(finding.get('summary'))}</span>"
+        )
+        if finding.get("evidence"):
+            out.append(f"<details><summary>evidence</summary><pre>{esc(str(finding['evidence'])[:3000])}</pre></details>")
+        if finding.get("recommendation"):
+            out.append(f"<div class='sub'>&rarr; {esc(finding['recommendation'])}</div>")
+        out.append(f"</td><td><code>{esc(finding.get('analyzer'))}</code></td></tr>")
+    out.append("</tbody></table></section></div>")
+
+    errors = payload.get("errors") or []
+    if errors:
+        out.append(
+            f"<section class='card'><h3>Analyzer errors ({len(errors)})</h3><pre>"
+            + esc("\n".join(errors))
+            + "</pre></section>"
+        )
     return "".join(out)
 
 
@@ -407,6 +510,20 @@ def _render_hosts(hosts: list[Any]) -> str:
                 )
             out.append("</ul>")
 
+        if getattr(host, "service_findings", None):
+            out.append(f"<h4>Service findings ({len(host.service_findings)})</h4>")
+            out.append("<table><thead><tr><th>Severity</th><th class='num'>Port</th>"
+                       "<th>Finding</th></tr></thead><tbody>")
+            for finding in host.service_findings:
+                severity = str(finding.get("severity") or "info").lower()
+                out.append(
+                    f"<tr><td><span class='sev sev-{esc(severity)}'>{esc(severity)}</span></td>"
+                    f"<td class='num'>{esc(finding.get('port'))}</td>"
+                    f"<td><strong>{esc(finding.get('title'))}</strong><br>"
+                    f"<span class='muted'>{esc(finding.get('summary'))}</span></td></tr>"
+                )
+            out.append("</tbody></table>")
+
         if host.notes:
             out.append("<h4>Notable</h4><ul class='notes'>")
             for note in host.notes:
@@ -470,10 +587,7 @@ def _render_web(webrecon: dict[str, Any]) -> str:
 
     out = [
         "<h2 class='section'>Web reconnaissance</h2>",
-        "<div class='notice'>Read-only: one HTTP <code>GET</code> per URL, no redirects "
-        "followed, no form submission, no authentication, no path brute forcing. "
-        f"Requests were capped at {esc(limits.get('rate_per_second'))} rps with "
-        f"{esc(limits.get('max_scripts_per_endpoint'))} script(s) per endpoint.</div>",
+        _render_web_method_notice(limits),
         "<input class='filter' type='search' data-scope='web-list' "
         "placeholder='Filter by host, title, technology or path&hellip;' "
         "aria-label='Filter web endpoints'>",
@@ -508,11 +622,45 @@ def _render_web(webrecon: dict[str, Any]) -> str:
             bits.append(f"redirects to {root['redirect_to']} (not followed)")
         out.append(f"<div class='sub'>{esc(' | '.join(bits))}</div>")
 
-        if root.get("technologies"):
+        technologies = result.get("technologies") or []
+        if technologies:
+            out.append(f"<h4>Technology stack ({len(technologies)})</h4><div>")
+            for tech in technologies:
+                label = tech.get("name", "")
+                if tech.get("version"):
+                    label = f"{label} {tech['version']}"
+                title = f"{tech.get('source', '')} / {tech.get('confidence', '')}"
+                out.append(
+                    f"<span class='tag web' title='{esc(title)}'>{esc(label)}</span>"
+                )
+            out.append("</div>")
+        elif root.get("technologies"):
             out.append("<h4>Technology hints</h4><div>")
             for tech in root["technologies"]:
                 out.append(f"<span class='tag web'>{esc(tech)}</span>")
             out.append("</div>")
+
+        cve_matches = result.get("cve_matches") or []
+        if cve_matches:
+            out.append(f"<h4>CVE correlations ({len(cve_matches)})</h4>")
+            out.append(
+                "<div class='sub'>Version-to-feed matches, <strong>not</strong> verified "
+                "exploitable conditions. Confirm the exact build and patch level.</div>"
+            )
+            out.append(
+                "<table><thead><tr><th>CVE</th><th class='num'>CVSS</th>"
+                "<th>Technology</th><th>Summary</th></tr></thead><tbody>"
+            )
+            for match in cve_matches[:100]:
+                severity = str(match.get("cvss_severity") or "unknown").lower()
+                out.append(
+                    f"<tr><td><code>{esc(match.get('cve_id'))}</code></td>"
+                    f"<td class='num'><span class='sev sev-{esc(severity)}'>"
+                    f"{esc(match.get('cvss_score'))}</span></td>"
+                    f"<td>{esc(match.get('technology'))} {esc(match.get('version'))}</td>"
+                    f"<td>{esc(str(match.get('summary') or '')[:300])}</td></tr>"
+                )
+            out.append("</tbody></table>")
 
         if root.get("disclosure_headers"):
             out.append("<h4>Version-disclosing headers</h4><table><tbody>")
@@ -549,6 +697,31 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 + "</pre></details>"
             )
 
+        paths = result.get("hidden_paths") or []
+        accessible = [p for p in paths if p.get("classification") == "accessible"]
+        if paths:
+            out.append(
+                f"<h4>Paths checked ({len(accessible)} accessible of "
+                f"{len(paths)} responding)</h4>"
+            )
+            out.append(
+                "<table><thead><tr><th>Path</th><th class='num'>Status</th>"
+                "<th>Result</th><th>Why it matters</th><th>Origin</th>"
+                "</tr></thead><tbody>"
+            )
+            for path in paths[:150]:
+                high = path.get("high_value")
+                classification = str(path.get("classification") or "")
+                css = "sev sev-high" if high and classification == "accessible" else "muted"
+                out.append(
+                    f"<tr><td><code>{esc(path.get('path'))}</code></td>"
+                    f"<td class='num'>{esc(path.get('status'))}</td>"
+                    f"<td class='{css}'>{esc(classification)}</td>"
+                    f"<td>{esc(path.get('reason'))}</td>"
+                    f"<td><span class='tag'>{esc(path.get('origin'))}</span></td></tr>"
+                )
+            out.append("</tbody></table>")
+
         out.append("<h4>JavaScript analysis</h4>")
         out.append(
             "<div class='sub'>"
@@ -562,7 +735,8 @@ def _render_web(webrecon: dict[str, Any]) -> str:
             + "</div>"
         )
 
-        secrets = [
+        javascript = result.get("javascript") or {}
+        secrets = javascript.get("secret_candidates") or [
             secret
             for script in result.get("scripts") or []
             for secret in (script.get("secret_candidates") or [])
@@ -586,26 +760,69 @@ def _render_web(webrecon: dict[str, Any]) -> str:
                 "under <code>webrecon/</code> for manual verification.</p>"
             )
 
-        paths = sorted(
-            {
-                path
-                for script in result.get("scripts") or []
-                for path in (script.get("endpoints") or [])
-            }
-        )
-        if paths:
+        pii = javascript.get("pii_candidates") or []
+        if pii:
+            summary = javascript.get("pii_summary") or {}
+            out.append(f"<h4>Personal data candidates ({len(pii)})</h4>")
             out.append(
-                f"<details><summary>Paths and URLs referenced in JavaScript "
-                f"({len(paths)})</summary><pre>" + esc("\n".join(paths[:600])) + "</pre></details>"
+                "<div class='notice'>Values are masked. The count and the kind are the "
+                "finding; the full data is in the saved bodies under <code>webrecon/</code>. "
+                "Treat the run directory as personal data and dispose of it accordingly."
+                "</div><div>"
+            )
+            for kind, count in sorted(summary.items()):
+                out.append(f"<span class='tag'>{esc(kind)}: {esc(count)}</span>")
+            out.append("</div>")
+            out.append(
+                "<table><thead><tr><th>Kind</th><th>Value (masked)</th>"
+                "<th>Source</th><th class='num'>Line</th></tr></thead><tbody>"
+            )
+            for match in pii[:60]:
+                out.append(
+                    f"<tr><td><span class='sev sev-medium'>{esc(match.get('kind'))}</span></td>"
+                    f"<td class='mono'>{esc(match.get('value'))}</td>"
+                    f"<td class='mono'>{esc(_short(match.get('source')))}</td>"
+                    f"<td class='num'>{esc(match.get('line'))}</td></tr>"
+                )
+            out.append("</tbody></table>")
+
+        infrastructure = javascript.get("infrastructure") or []
+        if infrastructure:
+            out.append(f"<h4>Internal infrastructure referenced ({len(infrastructure)})</h4>")
+            out.append("<table><thead><tr><th>Kind</th><th>Value</th><th>Source</th>"
+                       "</tr></thead><tbody>")
+            for match in infrastructure[:60]:
+                out.append(
+                    f"<tr><td><span class='sev sev-medium'>{esc(match.get('kind'))}</span></td>"
+                    f"<td class='mono'>{esc(match.get('value'))}</td>"
+                    f"<td class='mono'>{esc(_short(match.get('source')))}</td></tr>"
+                )
+            out.append("</tbody></table>")
+
+        api_paths = javascript.get("endpoints") or []
+        if api_paths:
+            out.append(
+                f"<details><summary>API surface referenced in front-end code "
+                f"({len(api_paths)})</summary>"
+                "<table><thead><tr><th>Method</th><th>Path or URL</th></tr></thead><tbody>"
+            )
+            for endpoint in api_paths[:600]:
+                out.append(
+                    f"<tr><td>{esc(endpoint.get('method') or '')}</td>"
+                    f"<td class='mono'>{esc(endpoint.get('value'))}</td></tr>"
+                )
+            out.append("</tbody></table></details>")
+
+        referenced = javascript.get("hosts_referenced") or []
+        if referenced:
+            out.append(
+                f"<details><summary>Hosts referenced by front-end code "
+                f"({len(referenced)}) - out of scope, not contacted</summary><pre>"
+                + esc("\n".join(referenced))
+                + "</pre></details>"
             )
 
-        source_maps = sorted(
-            {
-                sm
-                for script in result.get("scripts") or []
-                for sm in (script.get("source_maps") or [])
-            }
-        )
+        source_maps = javascript.get("source_maps") or []
         if source_maps:
             out.append(
                 "<details><summary>Source maps referenced "
@@ -640,6 +857,37 @@ def _render_web(webrecon: dict[str, Any]) -> str:
 def _dotted(pieces: list[str]) -> str:
     """Join already-unescaped pieces with a middot separator, escaping each."""
     return " &middot; ".join(esc(piece) for piece in pieces)
+
+
+def _render_web_method_notice(limits: dict[str, Any]) -> str:
+    """State exactly what was requested, including whether paths were probed.
+
+    This text has to track the run's real configuration. A report that claims
+    "no path brute forcing" after the operator passed --hidden-paths would
+    misrepresent what was done to the target, which is the one thing a
+    reconnaissance report must never do.
+    """
+    parts = [
+        "<div class='notice'>Read-only: one HTTP <code>GET</code> per URL, no redirects "
+        "followed, no form submission, no authentication. Requests were capped at "
+        f"{esc(limits.get('rate_per_second'))} rps with "
+        f"{esc(limits.get('max_scripts_per_endpoint'))} script(s) per endpoint."
+    ]
+    if limits.get("hidden_paths"):
+        parts.append(
+            " <strong>Path probing was enabled</strong> (<code>--hidden-paths</code>): up "
+            f"to {esc(limits.get('max_hidden_paths'))} curated path(s) per endpoint were "
+            "requested, so this run left 404s in the target's access log. The list is a "
+            "curated set of commonly exposed files, not a brute-force wordlist."
+        )
+    else:
+        parts.append(
+            " No path guessing: the only paths requested were <code>/</code>, the "
+            "well-known files, assets the page linked, and paths the site published "
+            "in its own robots.txt and sitemap.xml."
+        )
+    parts.append("</div>")
+    return "".join(parts)
 
 
 def _render_note(note: str) -> str:

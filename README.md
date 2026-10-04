@@ -27,6 +27,8 @@ rather than followed up.
 - [Scope enforcement and CIDR expansion](#scope-enforcement-and-cidr-expansion)
 - [Pipeline](#pipeline)
 - [Web recon and JavaScript analysis](#web-recon-and-javascript-analysis)
+- [Per-service deep analysis](#per-service-deep-analysis)
+- [CVE correlation](#cve-correlation)
 - [Reports](#reports)
 - [Guardrails](#guardrails)
 - [Privileges](#privileges)
@@ -96,6 +98,10 @@ sudo netrecon scan --targets scope.txt --scripts --banners
 
 # 5. Web recon + JavaScript analysis on any in-scope HTTP(S) port
 sudo netrecon scan --targets scope.txt --scripts --web
+
+# 6. The full deep-recon pass: per-service analysis, path probing, CVE feed
+sudo netrecon scan --targets scope.txt --scripts --web \
+    --service-recon --hidden-paths --cve-feed ./nvd-recent.json
 
 # 6. Add nuclei network templates (rate-capped, explicit opt-in)
 sudo netrecon scan --targets scope.txt --scripts --active
@@ -173,7 +179,8 @@ Stages are modular, individually toggleable, and resumable.
 | 6 | Safe NSE scripts | `nmap --script` | `--scripts`; `default`+`discovery`, forced `and safe` |
 | 7 | nuclei network templates | `nuclei` | `--active` only; rate-capped |
 | 8 | Web recon + JS analysis | (stdlib HTTP) | `--web` only; GET only, rate-capped |
-| 9 | Aggregation + reporting | — | `summary.json`, `report.md`, `report.html` |
+| 9 | Per-service deep analysis | (offline) | `--service-recon`; sends no packets |
+| 10 | Aggregation + reporting | — | `summary.json`, `report.md`, `report.html` |
 
 Stages 4–7 read the previous stage's checkpoint and re-filter it through the scope, so no
 stage can broaden the target set of the one before it. Stage 4 in particular scans **only
@@ -203,14 +210,112 @@ and its boundaries are the point of the design:
 | GET only — no POST/PUT/DELETE, no form submission | This is reconnaissance, not testing |
 | No authentication, no cookie jar, no credential handling | Nothing netrecon finds is ever used to log in |
 | No redirect following | A `Location` is recorded; a redirect cannot walk the scan off the authorised endpoint |
-| No path brute forcing or fuzzing | The only paths requested are `/`, the two well-known files, and scripts the page itself linked |
+| No fuzzing, ever | No parameter mutation, no injection payloads, under any flag |
+| Path probing is opt-in | By default the only paths requested are `/`, the two well-known files, assets the page linked, and paths the site published in robots.txt / sitemap.xml. `--hidden-paths` adds a curated list — see below |
 | No third-party fetches | A script on a CDN or another host is **not** downloaded — that address is not in scope |
 | Scope re-checked per endpoint | `enforce_strict` runs immediately before the socket opens; the URL host is always the in-scope IP literal, never a name |
 | No proxy | An empty `ProxyHandler` disables `*_PROXY` env vars so scan traffic goes straight to the target |
 
 **Caps** (all in `webrecon:`, all clamped in code): 100 endpoints per run, 25 scripts per
-endpoint, 2 MiB per response (hard max 16 MiB), 5 requests/second (hard max 50, warns above
-10), 10 s per request.
+endpoint, 120 curated paths per endpoint (hard max 400), 2 MiB per response (hard max
+16 MiB), 5 requests/second (hard max 50, warns above 10), 10 s per request.
+
+### What gets collected
+
+- **Both schemes.** Each open web port is tried over http *and* https rather than guessing
+  from the port number — TLS on 8080 and cleartext on 443 are common enough that guessing
+  loses whole services. The wrong scheme fails on the first request.
+- **Tech stack with versions.** From response headers, `<meta generator>`, framework
+  cookies, markup markers, JS bundle filenames (`jquery-3.4.1.min.js` → jQuery 3.4.1) and
+  nmap's own CPEs. Each detection carries a confidence and the string it came from.
+- **Source maps.** `.map` files referenced by scripts are fetched and their
+  `sourcesContent` analysed — the original unminified sources, which routinely contain
+  things the bundle does not.
+- **Hidden files and folders** (`--hidden-paths`). A curated ~120-entry list of
+  commonly exposed paths: `.git/HEAD`, `.env`, `appsettings.json`, `/actuator/env`,
+  backups, dumps, `swagger.json`, `/server-status`, editor and CI leftovers. Each entry
+  carries *why it matters*, and the result is classified `accessible` / `protected` /
+  `redirected`. **This is path probing**: it is off by default, announced in the pre-flight
+  summary, and will appear as 404s in the target's access log. It is capped at 400 entries
+  in code and is not, and must not become, a brute-force wordlist.
+
+### JavaScript analysis
+
+`netrecon/analyze/jsdata.py` runs over every asset — the page, inline scripts, linked
+scripts and source-map sources:
+
+| Extracted | Detail |
+| --- | --- |
+| **API surface** | Paths and absolute URLs, with the HTTP method where the call site reveals it (`axios.post(...)`, `fetch(..., {method})`, `xhr.open("PUT", ...)`). Template paths (`/users/${id}`) are kept. Static assets are excluded. |
+| **Secrets** | AWS/Google/Slack/GitHub/GitLab/Stripe/Twilio/SendGrid/npm/OpenAI key shapes, JWTs, private-key headers, credentials in URLs, connection strings, and `api_key = "…"` assignments |
+| **PII** | Emails, phone numbers, credit cards (**Luhn-validated**), IBAN, SSN and national-ID shapes |
+| **Infrastructure** | Internal hostnames (`.internal`, `.corp`, `staging.`, `jenkins.`…), private addresses, cloud metadata endpoints |
+| **Other** | Source maps, developer comments (TODO/FIXME/"do not ship"), every host referenced |
+
+**Everything sensitive is masked by default.** A secret renders as
+`9f2b********e8 (len 32)`, an email as `al*****@acme.vn`, a card as `************1111`.
+The full bodies are saved under `webrecon/` for verification. For PII the *count and kind*
+are the finding — a bundle containing 4,000 customer addresses is the thing to report;
+printing those addresses into a deliverable just moves the breach. `redact_secrets: false`
+unmasks and warns loudly in the pre-flight summary.
+
+False positives are filtered hard but not eliminated: placeholders (`your_api_key_here`,
+`${API_KEY}`, the documented AWS example key, low-entropy fillers) are dropped, cards must
+pass Luhn, IP addresses are not phone numbers, and a dotted identifier is only a hostname if
+its last label is a real suffix — so `axios.post` and `ops.team@acme.vn` do not become hosts.
+Treat every remaining hit as a lead to check.
+
+**Hosts discovered in front-end code are reported, never contacted.** A hostname found in a
+bundle is outside the authorised IP scope until you put it in the scope file. netrecon lists
+it under "Hosts referenced by front-end code — out of scope, not contacted" and stops there.
+
+## Per-service deep analysis
+
+`--service-recon` turns raw tool text into structured findings. It **sends no packets**: it
+re-reads `services.json` and `scripts.json` and analyses what is already there, so it is
+cheap, repeatable, and works offline against an old run directory via `netrecon report`.
+
+| Analyzer | Looks for |
+| --- | --- |
+| `tls` | Expired / not-yet-valid / expiring certificates, self-signed, hostname mismatch, weak signature algorithms, RSA < 2048, over-long validity, clock skew |
+| `smb` | Signing not required, SMBv1 enabled, anonymous shares, guest access, end-of-support Windows, OS/domain/FQDN for pivoting |
+| `database` | Unauthenticated access (only on positive proof), exposed engines, readable database names, version age, missing transport encryption |
+| `ssh` | Weak host keys (DSA, RSA < 2048), weak KEX/cipher/MAC, SSHv1, outdated OpenSSH |
+| `snmp` | Readable with the default community, system information, interface / process / software enumeration, v1/v2c in use |
+| `dns` | Open recursion, version disclosure, cache snooping, SRV records |
+| `mail` | Missing STARTTLS, cleartext auth offered, VRFY/EXPN, NTLM disclosure, open relay (only on positive proof) |
+| `http` | Dangerous methods, exposed `.git`, config backups, open proxy, technology stack, version disclosure |
+
+Severity is an **exposure** judgement — "an assessor should look at this today" — never an
+exploitability claim. Every finding quotes the tool output it came from, so a reader can
+check the conclusion without rescanning. Findings that the evidence does not support are not
+emitted: an open 161/udp does not become "readable with the default community", and an open
+3306 does not become "no authentication".
+
+The one exception to "no packets" is the TLS analyzer, which may open a single connection
+per endpoint when `--scripts` did not run and no `ssl-cert` output exists. That is
+`allow_tls_probe` in the config, and the address is re-checked with `enforce_strict` before
+the socket opens.
+
+## CVE correlation
+
+`--cve-feed <file>` correlates detected product versions against a CVE feed **you supply as
+a local file**. This is deliberate:
+
+- **netrecon ships no CVE data and makes no network request to fetch any.** Hardcoding a
+  CVE list would put stale, unverifiable claims into a penetration-test report.
+- Supported feed shapes: NVD JSON 2.0, NVD JSON 1.1, and a simple
+  `{"entries": [{"cve", "cpe", "version_start_including", "version_end_excluding", "cvss",
+  "severity", "summary"}]}` format.
+- Version ranges are honoured (`versionStartIncluding` / `versionEndExcluding` and friends).
+  A `*` version with no range never matches — that would flood the report.
+
+Results are labelled, in every output, as **correlation, not verification**: a match means
+"this version appears in a feed entry", never "this host is exploitable". Backported
+vendor patches and coarse CPE ranges both produce false positives, so confirm the exact
+build and patch level before reporting anything.
+
+Get a feed from <https://nvd.nist.gov/vuln/data-feeds> and point `--cve-feed` at it.
 
 **Secret candidates.** Strings matching AWS/Google/Slack/GitHub/Stripe key shapes, JWTs,
 private-key headers, credentials in URLs, and `api_key = "…"` style assignments are
@@ -501,7 +606,7 @@ host's networks. The image bundles nmap, masscan, fping, naabu and nuclei.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q            # ~317 tests, no network access
+pytest -q            # ~1000 tests, no network access
 ruff check .
 ```
 
@@ -545,7 +650,17 @@ netrecon/
 │   ├── services.py         # nmap -sV, OS detection, banners
 │   ├── scripts.py          # safe NSE policy and execution
 │   ├── nuclei.py           # optional active stage
-│   └── webrecon.py         # GET-only web recon + JS analysis
+│   ├── webrecon.py         # GET-only web recon + JS analysis
+│   ├── wellknown.py        # the curated path list (deliberately not a wordlist)
+│   └── servicerecon.py     # offline per-service analysis
+├── analyze/
+│   ├── base.py             # Finding / ServiceEvidence / Analyzer interface
+│   ├── registry.py         # which analyzers exist, listed explicitly
+│   ├── tls.py  smb.py  database.py  ssh.py
+│   ├── snmp.py  dns.py  mail.py  httpsvc.py
+│   ├── techstack.py        # product + version + CPE fingerprinting
+│   ├── cve.py              # offline CVE feed correlation
+│   └── jsdata.py           # API / secrets / PII / infrastructure from front-end code
 ├── parse/
 │   ├── nmap.py             # nmap XML -> dataclasses
 │   └── masscan.py          # masscan JSON/list, naabu JSON
@@ -570,5 +685,13 @@ netrecon/
 - Web recon reads only `/` and what that page links. It does not crawl, so an application
   whose routes are all behind a login or a client-side router will show little beyond the
   JavaScript bundle - which is usually where the interesting paths are anyway.
-- JS secret patterns are regex-based and will produce false positives (and miss anything
-  obfuscated or assembled at runtime). Verify every candidate against the saved body.
+- JS secret and PII patterns are regex-based. They will produce false positives and will
+  miss anything obfuscated or assembled at runtime. Verify every candidate against the
+  saved body before it reaches a deliverable.
+- Hidden-path probing checks a curated list, not every possible path. A negative result
+  means "none of these ~120 paths responded", not "nothing is exposed".
+- CVE correlation is only as good as the feed you supply, and matches by version string.
+  Backported vendor patches make it over-report; coarse CPE ranges make it both over- and
+  under-report. It is a triage aid, not a vulnerability assessment.
+- The run directory can end up holding personal data and credential material pulled from
+  the target's front-end. Treat it as engagement-sensitive and dispose of it accordingly.

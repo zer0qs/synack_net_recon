@@ -132,22 +132,111 @@ def _webrecon():
                     {"path": "/robots.txt", "status": 200, "bytes": 40, "preview": "Disallow: /admin"}
                 ],
                 "scripts": [
+                    {"source": "http://10.0.0.1:80/app.js", "status": 200, "bytes": 4096}
+                ],
+                "technologies": [
                     {
-                        "source": "http://10.0.0.1:80/app.js",
-                        "endpoints": ["/api/v1/me", "/api/v1/orders", "/graphql"],
-                        "secret_candidates": [
-                            {
-                                "kind": "assigned_secret",
-                                "name": "api_key",
-                                "value": "9f2b********e8 (len 32)",
-                                "line": "10",
-                                "source": "http://10.0.0.1:80/app.js",
-                            }
-                        ],
-                        "source_maps": ["/app.js.map"],
+                        "name": "React",
+                        "version": None,
+                        "categories": ["framework"],
+                        "confidence": "likely",
+                        "source": "script-url",
+                        "evidence": "react-dom.production.min.js",
+                        "cpe": None,
+                    },
+                    {
+                        "name": "nginx",
+                        "version": "1.18.0",
+                        "categories": ["web-server"],
+                        "confidence": "certain",
+                        "source": "header:server",
+                        "evidence": "nginx/1.18.0",
+                        "cpe": "cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*",
                     }
                 ],
-                "totals": {"scripts_analysed": 1, "js_endpoints": 3, "secret_candidates": 1},
+                "cve_matches": [
+                    {
+                        "cve_id": "CVE-2024-00000",
+                        "cvss_score": 7.5,
+                        "cvss_severity": "high",
+                        "technology": "nginx",
+                        "version": "1.18.0",
+                        "summary": "Synthetic test entry from a local feed.",
+                        "matched_cpe": "cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*",
+                        "source": "feed.json",
+                    }
+                ],
+                "hidden_paths": [
+                    {
+                        "path": "/.git/HEAD",
+                        "origin": "curated",
+                        "reason": "Git repository exposed",
+                        "status": 200,
+                        "bytes": 23,
+                        "classification": "accessible",
+                        "high_value": True,
+                    },
+                    {
+                        "path": "/admin",
+                        "origin": "robots",
+                        "reason": "listed in robots.txt",
+                        "status": 403,
+                        "bytes": 12,
+                        "classification": "protected",
+                        "high_value": False,
+                    },
+                ],
+                "javascript": {
+                    "endpoints": [
+                        {"value": "/api/v1/me", "kind": "path", "method": "GET"},
+                        {"value": "/api/v1/orders", "kind": "path", "method": "POST"},
+                        {"value": "/graphql", "kind": "path", "method": None},
+                    ],
+                    "secret_candidates": [
+                        {
+                            "kind": "assigned_secret",
+                            "name": "api_key",
+                            "value": "9f2b********e8 (len 32)",
+                            "line": 10,
+                            "source": "http://10.0.0.1:80/app.js",
+                        }
+                    ],
+                    "pii_candidates": [
+                        {
+                            "kind": "email",
+                            "value": "al*****@acme.vn",
+                            "line": 42,
+                            "source": "http://10.0.0.1:80/app.js",
+                        }
+                    ],
+                    "pii_summary": {"email": 1},
+                    "infrastructure": [
+                        {
+                            "kind": "internal_hostname",
+                            "value": "staging.internal.acme.corp",
+                            "line": 7,
+                            "source": "http://10.0.0.1:80/app.js",
+                        }
+                    ],
+                    "hosts_referenced": ["staging.internal.acme.corp"],
+                    "source_maps": ["/app.js.map"],
+                    "totals": {
+                        "endpoints": 3,
+                        "secrets": 1,
+                        "pii": 1,
+                        "infrastructure": 1,
+                        "hosts_referenced": 1,
+                    },
+                },
+                "totals": {
+                    "scripts_analysed": 1,
+                    "js_endpoints": 3,
+                    "secret_candidates": 1,
+                    "pii_candidates": 1,
+                    "paths_accessible": 1,
+                    "technologies": 1,
+                    "cve_matches": 1,
+                },
             }
         ],
     }
@@ -226,7 +315,31 @@ def test_category_rows_link_to_the_host_section(document):
 def test_web_section_reports_the_read_only_method(document):
     assert "Web reconnaissance" in document
     assert "no form submission" in document
-    assert "no path brute forcing" in document
+    assert "no redirects followed" in document
+
+
+def test_method_notice_says_no_guessing_when_paths_were_not_probed(document):
+    """With path probing off, the report must say nothing was guessed."""
+    assert "No path guessing" in document
+    assert "robots.txt and sitemap.xml" in document
+
+
+def test_method_notice_admits_path_probing_when_it_happened():
+    """The notice must track the real run.
+
+    Claiming "no path brute forcing" after --hidden-paths ran would
+    misrepresent what was done to the target. That is the one thing a
+    reconnaissance report must never do, so it is asserted here.
+    """
+    webrecon = _webrecon()
+    webrecon["limits"]["hidden_paths"] = True
+    webrecon["limits"]["max_hidden_paths"] = 120
+    hosts = _hosts()
+    doc = render_html(_payload(), hosts, group_by_category(hosts), webrecon)
+    assert "Path probing was enabled" in doc
+    assert "404s in the target's access log" in doc
+    assert "not a brute-force wordlist" in doc
+    assert "No path guessing" not in doc
 
 
 def test_web_section_shows_findings(document):
@@ -410,3 +523,75 @@ def test_summary_json_stays_machine_readable(make_context):
     payload = json.loads(ctx.paths.summary.read_text())
     assert payload["categories"][0]["key"] == "database"
     assert payload["hosts"][0]["categories"] == ["database"]
+
+
+# -- deep recon sections -------------------------------------------------
+
+
+def test_technology_stack_is_rendered_with_versions(document):
+    assert "Technology stack" in document
+    assert "nginx 1.18.0" in document
+
+
+def test_cve_correlations_are_labelled_as_unverified(document):
+    assert "CVE-2024-00000" in document
+    assert "not</strong> verified" in document or "not verified" in document
+
+
+def test_paths_section_shows_both_outcomes_and_origin(document):
+    assert "/.git/HEAD" in document
+    assert "accessible" in document
+    assert "protected" in document
+    assert "robots" in document
+
+
+def test_pii_section_masks_and_warns(document):
+    assert "Personal data candidates" in document
+    assert "al*****@acme.vn" in document
+    assert "Values are masked" in document
+    assert "dispose of it" in document
+
+
+def test_api_surface_is_listed_with_methods(document):
+    assert "/api/v1/orders" in document
+    assert "API surface referenced" in document
+
+
+def test_referenced_hosts_are_marked_out_of_scope(document):
+    assert "staging.internal.acme.corp" in document
+    assert "out of scope, not contacted" in document
+
+
+def test_findings_tab_renders_service_findings():
+    hosts = _hosts()
+    findings = {
+        "by_severity": {"high": 1},
+        "errors": [],
+        "results": [
+            {
+                "analyzer": "tls",
+                "ip": "10.0.0.1",
+                "port": 443,
+                "protocol": "tcp",
+                "findings": [
+                    {
+                        "key": "tls.expired-certificate",
+                        "title": "Certificate has expired",
+                        "severity": "high",
+                        "summary": "notAfter is in the past.",
+                        "evidence": "Not valid after: 2023-01-01T00:00:00",
+                        "recommendation": "Renew the certificate.",
+                    }
+                ],
+            }
+        ],
+    }
+    doc = render_html(_payload(), hosts, group_by_category(hosts), None, findings)
+    assert "tab-findings" in doc
+    assert "Certificate has expired" in doc
+    assert "exposure</strong> judgement" in doc
+    assert "sent no packets" in doc
+
+
+def test_findings_tab_is_absent_when_the_stage_did_not_run(document):
+    assert "tab-findings" not in document

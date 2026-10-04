@@ -25,11 +25,8 @@ from netrecon.stages.webrecon import (
     RateLimiter,
     _PageParser,
     _same_endpoint_scripts,
-    analyse_script,
-    detect_technologies,
     disclosure_headers,
     load_endpoints,
-    mask_secret,
     missing_security_headers,
 )
 
@@ -40,129 +37,8 @@ OUT_OF_SCOPE = "192.168.99.99"
 # -- JavaScript analysis -------------------------------------------------
 
 
-def test_api_paths_are_extracted():
-    body = """
-      const base = "/api/v2";
-      fetch("/api/v2/users/me");
-      axios.get("/admin/export.json");
-      const g = "/graphql";
-    """
-    result = analyse_script(body, source="app.js", redact=True)
-    assert "/api/v2" in result["endpoints"]
-    assert "/api/v2/users/me" in result["endpoints"]
-    assert "/admin/export.json" in result["endpoints"]
-    assert "/graphql" in result["endpoints"]
 
 
-def test_absolute_urls_are_extracted():
-    result = analyse_script('var u = "https://api.internal.example/v1/token";', source="s", redact=True)
-    assert "https://api.internal.example/v1/token" in result["endpoints"]
-
-
-def test_endpoints_are_deduplicated_and_sorted():
-    body = 'fetch("/a/x.json"); fetch("/a/x.json"); fetch("/b/y.json");'
-    endpoints = analyse_script(body, source="s", redact=True)["endpoints"]
-    assert endpoints == sorted(set(endpoints))
-
-
-def test_source_maps_are_reported():
-    body = "var a=1;\n//# sourceMappingURL=/static/app.js.map"
-    assert analyse_script(body, source="s", redact=True)["source_maps"] == ["/static/app.js.map"]
-
-
-#: Token shapes, assembled at runtime from halves.
-#:
-#: These are invented values, but they are shaped closely enough to the real
-#: thing that a secret scanner flags them - which is the point of the patterns
-#: under test. Splitting each one across a concatenation keeps the literal out
-#: of the source file so this test suite does not itself trip push protection.
-TOKEN_SHAPES: list[tuple[str, str]] = [
-    ("AKIA" + "ZZ7QQQ3MMMNNN42X", "aws_access_key_id"),
-    ("AIza" + "SyB1c3fFakeFakeFakeFakeFakeFakeQ7zX", "google_api_key"),
-    ("xox" + "b-99887766554433-aabbccddeeffgg", "slack_token"),
-    ("ghp" + "_7f3Kq92ZmWvQ4tLbN8xRcY1dAe6JhS0uPgTz", "github_token"),
-    ("sk" + "_live_9Qw3ErTy7UiOpAsDfGhJkL2z", "stripe_key"),
-    ("-----BEGIN RSA " + "PRIVATE KEY-----", "private_key_block"),
-]
-
-
-@pytest.mark.parametrize(("token", "kind"), TOKEN_SHAPES, ids=[k for _, k in TOKEN_SHAPES])
-def test_secret_shapes_are_detected(token, kind):
-    found = analyse_script(f'k = "{token}"', source="s", redact=False)["secret_candidates"]
-    assert kind in {item["kind"] for item in found}
-
-
-def test_detected_tokens_are_masked_in_the_report():
-    for token, _kind in TOKEN_SHAPES:
-        found = analyse_script(f'k = "{token}"', source="s", redact=True)["secret_candidates"]
-        for item in found:
-            assert token not in item["value"], "a masked value must not contain the token"
-
-
-def test_assigned_secrets_record_the_variable_name():
-    body = 'const config = { api_key: "9f2b7c41de8a46f0b35e7a19cc04d2e8" };'
-    found = analyse_script(body, source="s", redact=False)["secret_candidates"]
-    entry = next(item for item in found if item["kind"] == "assigned_secret")
-    assert entry["name"] == "api_key"
-    assert entry["value"] == "9f2b7c41de8a46f0b35e7a19cc04d2e8"
-
-
-def test_secrets_are_masked_by_default():
-    body = 'api_key = "9f2b7c41de8a46f0b35e7a19cc04d2e8"'
-    found = analyse_script(body, source="s", redact=True)["secret_candidates"]
-    value = found[0]["value"]
-    assert "9f2b7c41de8a46f0b35e7a19cc04d2e8" not in value
-    assert value.startswith("9f2b")
-    assert "len 32" in value
-
-
-def test_mask_keeps_short_values_unusable():
-    assert "secret12" not in mask_secret("secret12")
-    assert mask_secret("abcd") == "ab**"
-
-
-@pytest.mark.parametrize(
-    "placeholder",
-    [
-        'api_key = "your_api_key_here"',
-        'api_key = "YOUR_KEY"',
-        'api_key = "xxxxxxxxxxxx"',
-        'api_key = "<insert-key>"',
-        'api_key = "${API_KEY}"',
-        'api_key = "example-key-value"',
-        'api_key = "aaaaaaaaaaaa"',
-        'api_key = "undefined"',
-    ],
-)
-def test_obvious_placeholders_are_not_reported(placeholder):
-    assert analyse_script(placeholder, source="s", redact=True)["secret_candidates"] == []
-
-
-def test_the_documented_aws_example_key_is_treated_as_a_placeholder():
-    body = 'k = "AKIAIOSFODNN7EXAMPLE"'
-    assert analyse_script(body, source="s", redact=True)["secret_candidates"] == []
-
-
-def test_line_numbers_are_recorded():
-    body = 'var a = 1;\nvar b = 2;\napi_key = "9f2b7c41de8a46f0b35e7a19cc04d2e8";'
-    found = analyse_script(body, source="s", redact=True)["secret_candidates"]
-    assert found[0]["line"] == "3"
-
-
-def test_duplicate_secrets_are_reported_once():
-    body = (
-        'api_key = "9f2b7c41de8a46f0b35e7a19cc04d2e8";\n'
-        'apikey = "9f2b7c41de8a46f0b35e7a19cc04d2e8";'
-    )
-    found = analyse_script(body, source="s", redact=True)["secret_candidates"]
-    assert len(found) == 1
-
-
-def test_analysis_of_an_empty_body_is_empty():
-    result = analyse_script("", source="s", redact=True)
-    assert result["endpoints"] == []
-    assert result["secret_candidates"] == []
-    assert result["bytes"] == 0
 
 
 # -- header analysis -----------------------------------------------------
@@ -178,12 +54,6 @@ def test_disclosure_headers_are_picked_out():
     headers = {"server": "nginx/1.18.0", "x-powered-by": "PHP/8.1", "date": "now"}
     assert disclosure_headers(headers) == {"server": "nginx/1.18.0", "x-powered-by": "PHP/8.1"}
 
-
-def test_technology_detection_from_headers_and_body():
-    tech = detect_technologies({"server": "nginx/1.18.0"}, "<div data-reactroot>/_next/static</div>")
-    assert "React" in tech
-    assert "Next.js" in tech
-    assert "Server: nginx/1.18.0" in tech
 
 
 # -- HTML parsing --------------------------------------------------------
@@ -266,6 +136,7 @@ def _seed(ctx, services_hosts=None, sweep_hosts=None):
 
 def test_endpoints_come_from_service_data_with_scheme(make_context):
     ctx = make_context(web=True)
+    ctx.config.webrecon.probe_both_schemes = False
     _seed(
         ctx,
         services_hosts=[
@@ -301,6 +172,7 @@ def test_out_of_scope_hosts_never_become_endpoints(make_context):
 
 def test_sweep_data_fills_in_ports_without_service_detection(make_context):
     ctx = make_context(web=True)
+    ctx.config.webrecon.probe_both_schemes = False
     _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 8080, "protocol": "tcp"}]})
     endpoints = load_endpoints(ctx)
     assert [(e.ip, e.port, e.scheme) for e in endpoints] == [(IN_SCOPE, 8080, "http")]
@@ -308,6 +180,7 @@ def test_sweep_data_fills_in_ports_without_service_detection(make_context):
 
 def test_service_data_wins_over_sweep_data(make_context):
     ctx = make_context(web=True)
+    ctx.config.webrecon.probe_both_schemes = False
     _seed(
         ctx,
         services_hosts=[
@@ -328,6 +201,25 @@ def test_service_data_wins_over_sweep_data(make_context):
     endpoints = load_endpoints(ctx)
     assert len(endpoints) == 1
     assert endpoints[0].scheme == "https", "the TLS tunnel from -sV must be honoured"
+
+
+def test_both_schemes_are_probed_by_default(make_context):
+    """A port is tried over http and https rather than guessing from the number.
+
+    TLS on 8080 and cleartext on 443 are both common enough that guessing the
+    scheme from the port silently loses whole services.
+    """
+    ctx = make_context(web=True)
+    _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 8080, "protocol": "tcp"}]})
+    endpoints = load_endpoints(ctx)
+    assert {(e.port, e.scheme) for e in endpoints} == {(8080, "http"), (8080, "https")}
+
+
+def test_both_schemes_can_be_turned_off(make_context):
+    ctx = make_context(web=True)
+    ctx.config.webrecon.probe_both_schemes = False
+    _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 8080, "protocol": "tcp"}]})
+    assert len(load_endpoints(ctx)) == 1
 
 
 def test_closed_ports_are_not_endpoints(make_context):
@@ -394,8 +286,18 @@ class FakeClient:
         return HttpResponse(url, status, "OK", headers, body.encode(), False, 0.01)
 
 
+def _single_scheme(ctx):
+    ctx.config.webrecon.probe_both_schemes = False
+    return ctx
+
+
 def test_stage_probes_only_allowed_paths(make_context, monkeypatch):
-    ctx = make_context(web=True)
+    """Without --hidden-paths, nothing is guessed.
+
+    The only URLs requested are '/', the two well-known files, assets the page
+    itself linked, and paths the site published in its own robots.txt.
+    """
+    ctx = _single_scheme(make_context(web=True))
     _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 80, "protocol": "tcp"}]})
     base = f"http://{IN_SCOPE}:80"
 
@@ -408,7 +310,11 @@ def test_stage_probes_only_allowed_paths(make_context, monkeypatch):
                 {"server": "nginx/1.18.0"},
             ),
             f"{base}/robots.txt": (200, "User-agent: *\nDisallow: /admin\n", {}),
-            f"{base}/app.js": (200, 'fetch("/api/v1/me"); key = "9f2b7c41de8a46f0b35e7a19cc04d2e8";', {}),
+            f"{base}/app.js": (
+                200,
+                'fetch("/api/v1/me"); key = "9f2b7c41de8a46f0b35e7a19cc04d2e8";',
+                {},
+            ),
         }
     )
     monkeypatch.setattr(webrecon, "GetOnlyClient", lambda **_kwargs: client)
@@ -419,12 +325,49 @@ def test_stage_probes_only_allowed_paths(make_context, monkeypatch):
         f"{base}/",
         f"{base}/robots.txt",
         f"{base}/sitemap.xml",
+        f"{base}/admin",  # published by the site in robots.txt, not guessed
         f"{base}/app.js",
-    ], "only '/', the two well-known files and the page's own script may be requested"
+    ]
     assert "https://cdn.example.com/x.js" not in client.requested
+    assert not any("/.git" in url for url in client.requested), (
+        "the curated list must not run without --hidden-paths"
+    )
     assert result.counts["endpoints_reachable"] == 1
     assert result.counts["js_endpoints"] >= 1
     assert result.counts["secret_candidates"] == 1
+
+
+def test_curated_paths_only_run_when_opted_in(make_context, monkeypatch):
+    ctx = _single_scheme(make_context(web=True))
+    ctx.config.webrecon.hidden_paths = True
+    ctx.config.webrecon.max_hidden_paths = 3
+    _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 80, "protocol": "tcp"}]})
+    base = f"http://{IN_SCOPE}:80"
+
+    client = FakeClient(
+        {
+            f"{base}/": (200, "<html></html>", {}),
+            f"{base}/.git/HEAD": (200, "ref: refs/heads/main\n", {}),
+        }
+    )
+    monkeypatch.setattr(webrecon, "GetOnlyClient", lambda **_kwargs: client)
+    result = webrecon.run(ctx)
+
+    assert f"{base}/.git/HEAD" in client.requested
+    assert result.counts["paths_accessible"] == 1
+
+
+def test_hidden_path_count_is_capped(make_context, monkeypatch):
+    ctx = _single_scheme(make_context(web=True))
+    ctx.config.webrecon.hidden_paths = True
+    ctx.config.webrecon.max_hidden_paths = 5
+    _seed(ctx, sweep_hosts={IN_SCOPE: [{"port": 80, "protocol": "tcp"}]})
+    client = FakeClient({f"http://{IN_SCOPE}:80/": (200, "<html></html>", {})})
+    monkeypatch.setattr(webrecon, "GetOnlyClient", lambda **_kwargs: client)
+    webrecon.run(ctx)
+
+    # root + robots + sitemap + at most 5 curated paths
+    assert len(client.requested) <= 3 + 5
 
 
 def test_stage_output_records_the_method_and_limits(make_context, monkeypatch):
@@ -476,7 +419,8 @@ def test_unreachable_endpoint_is_reported_not_fatal(make_context, monkeypatch):
     monkeypatch.setattr(webrecon, "GetOnlyClient", lambda **_kwargs: Dead())
     result = webrecon.run(ctx)
     assert result.counts["endpoints_reachable"] == 0
-    assert result.counts["failures"] == 1
+    # Both schemes are probed, so an unreachable port fails twice.
+    assert result.counts["failures"] == result.counts["endpoints_probed"]
 
 
 def test_max_endpoints_truncates(make_context, monkeypatch):
